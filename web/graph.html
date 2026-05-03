@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>因果链 — 超级记忆系统</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;overflow:hidden}
+#canvas{width:100vw;height:100vh}
+.toolbar{position:fixed;top:12px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:10;background:#1e293b;padding:8px 14px;border-radius:10px;border:1px solid #334155;align-items:center}
+.toolbar button{padding:6px 14px;border:none;border-radius:6px;background:#334155;color:#e2e8f0;cursor:pointer;font-size:12px;transition:background .2s}
+.toolbar button:hover{background:#475569}
+.toolbar span{color:#64748b;font-size:12px}
+.tooltip{position:fixed;max-width:360px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px;font-size:13px;line-height:1.5;pointer-events:none;z-index:20;display:none;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+.tooltip .tp-title{color:#f1f5f9;font-weight:500;margin-bottom:4px}
+.tooltip .tp-type{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;margin-bottom:6px}
+.tooltip .tp-content{color:#94a3b8;font-size:12px}
+.tooltip .tp-meta{color:#64748b;font-size:11px;margin-top:4px}
+.node circle{stroke:#fff;stroke-width:1.5;cursor:pointer;transition:stroke-width .2s}
+.node circle:hover{stroke-width:3}
+.node text{font-size:12px;fill:#cbd5e1;pointer-events:none;text-shadow:0 1px 3px #0f172a}
+.link{fill:none;stroke:#475569;stroke-width:1.5;marker-end:url(#arrow)}
+.link-label{font-size:10px;fill:#64748b;text-anchor:middle;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="canvas"></div>
+<div class="toolbar">
+<span>🧠 线性因果链</span>
+<button onclick="location.href='/'">← 返回</button>
+<button onclick="autoFit()">适应视图</button>
+<button onclick="window.location.reload()">刷新</button>
+</div>
+<div id="tooltip" class="tooltip"></div>
+
+<svg id="svg" width="100%" height="100%" style="position:fixed;top:0;left:0">
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="20" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+<path d="M0,0 L10,5 L0,10" fill="#64748b"/>
+</marker>
+</defs>
+</svg>
+
+<script>
+const API = '/api/v1/memory';
+const svg = d3.select('#svg');
+const g = svg.append('g');
+const tooltip = d3.select('#tooltip');
+
+let currentNodeId = '';
+
+/**
+ * 从 URL 参数 ?node=xxx 获取要展示的节点 ID
+ */
+function getNodeId() {
+    const p = new URLSearchParams(location.search);
+    return p.get('node') || '';
+}
+
+/**
+ * 加载因果链数据并渲染
+ * @param {string} nodeId - 可选，中心节点 ID，为空时显示最近记忆
+ */
+async function loadGraph(nodeId) {
+    currentNodeId = nodeId || getNodeId();
+    if(!currentNodeId) {
+        // 无指定节点，展示最近记忆的图谱
+        const r = await fetch(API+'/graph?depth=3');
+        const d = await r.json();
+        if(d.code===0) render(d.data);
+        return;
+    }
+    try {
+        // 以指定节点为中心，获取因果链
+        const r = await fetch(API+'/graph?node_id='+currentNodeId+'&depth=3');
+        const d = await r.json();
+        if(d.code===0 && d.data.nodes.length) render(d.data);
+        else showEmpty();
+    } catch(e) { showEmpty(); }
+}
+
+/**
+ * 渲染线性因果链
+ * 设计原则：D3.js 沿 x 轴线性排列（左→右 = 原因→后果）
+ * 使用拓扑排序确定排列顺序，节点上下错落避免边重叠
+ */
+function render(data) {
+    const nd = data.nodes.map(n => ({id:n.id, name:n.name, type:n.type, content:n.content, weight:n.weight||1, created:n.created_at||''}));
+    const ed = data.edges.map(e => ({source:e.from_id, target:e.to_id, type:e.type, weight:e.weight||1, context:e.context||''}));
+
+    if(!nd.length) { showEmpty(); return; }
+
+    g.selectAll('*').remove();
+
+    // --- 拓扑排序 ---
+    // 统计每个节点的入边数，根节点（无入边）作为排列起点
+    const edgeMap = {}; // id -> 入边计数
+    nd.forEach(n => { edgeMap[n.id] = 0; });
+    ed.forEach(e => {
+        if(edgeMap[e.target]!==undefined) edgeMap[e.target]++;
+    });
+
+    // DFS 拓扑排序，保证因果方向从左到右
+    const roots = nd.filter(n => edgeMap[n.id]===0);
+    const ordered = [];
+    const visited = new Set();
+    function dfs(id) {
+        if(visited.has(id)) return;
+        visited.add(id);
+        const node = nd.find(n => n.id===id);
+        if(node) ordered.push(node);
+        ed.filter(e => e.source===id).forEach(e => dfs(e.target));
+    }
+    roots.forEach(r => dfs(r.id));
+    nd.forEach(n => { if(!visited.has(n.id)) ordered.push(n); }); // 拓扑外节点追加到末尾
+
+    // --- x 轴线性布局 ---
+    const w = window.innerWidth, h = window.innerHeight;
+    const gapX = Math.min(220, (w-80) / Math.max(ordered.length, 1));
+    const radius = 24;
+
+    ordered.forEach((n, i) => {
+        n.fx = 60 + i * gapX;                           // x 轴均匀排列
+        n.fy = h / 2 + (i%2===0 ? -40 : 40);           // y 轴上下错落，视觉更清晰
+    });
+
+    // --- 绘制有向边 ---
+    ed.forEach(e => {
+        const src = nd.find(n => n.id===e.source);
+        const tgt = nd.find(n => n.id===e.target);
+        if(!src || !tgt) return;
+        const x1 = src.fx, y1 = src.fy, x2 = tgt.fx, y2 = tgt.fy;
+        g.append('line')
+            .attr('class', 'link')
+            .attr('x1', x1).attr('y1', y1)
+            .attr('x2', x2).attr('y2', y2)
+            .style('stroke', e.type==='CAUSED_BY' ? '#f59e0b' : '#475569') // 因果边用金色高亮
+            .style('stroke-width', Math.max(1, (e.weight||1)*2));
+
+        // 边类型标签
+        const mx = (x1+x2)/2, my = (y1+y2)/2;
+        g.append('text')
+            .attr('class', 'link-label')
+            .attr('x', mx).attr('y', my-10)
+            .text(e.type);
+    });
+
+    // --- 绘制节点 ---
+    const nodeGroup = g.selectAll('.node')
+        .data(ordered)
+        .enter().append('g')
+        .attr('class', 'node')
+        .attr('transform', d => `translate(${d.fx},${d.fy})`)
+        .on('click', function(e,d) {
+            // 点击节点跳转到该节点的因果链视图
+            e.stopPropagation();
+            window.location.href = '/graph.html?node='+d.id;
+        })
+        .on('mouseenter', function(e,d) {
+            // 悬停显示节点详情
+            tooltip.html(`
+                <div class="tp-title">${esc(d.name)}</div>
+                <span class="tp-type" style="background:${typeColor(d.type)}33;color:${typeColor(d.type)}">${d.type}</span>
+                <div class="tp-content">${esc(d.content||'')}</div>
+                <div class="tp-meta">权重 ${d.weight} · ${d.created}</div>
+            `).style('display','block')
+            .style('left', (e.pageX+12)+'px')
+            .style('top', (e.pageY-10)+'px');
+        })
+        .on('mouseleave', () => tooltip.style('display','none'));
+
+    // 圆形节点，按 type 区分颜色，当前选中节点蓝色边框高亮
+    nodeGroup.append('circle')
+        .attr('r', radius)
+        .attr('fill', d => typeColor(d.type))
+        .attr('stroke', d => d.id===currentNodeId ? '#60a5fa' : '#fff')
+        .attr('stroke-width', d => d.id===currentNodeId ? 3 : 1.5);
+
+    // 节点名称标签（超长截断加省略号）
+    nodeGroup.append('text')
+        .text(d => d.name.length>10 ? d.name.slice(0,10)+'…' : d.name)
+        .attr('text-anchor', 'middle')
+        .attr('dy', radius+16)
+        .attr('fill', '#cbd5e1')
+        .style('font-size', '12px');
+}
+
+/**
+ * 节点类型到颜色的映射
+ */
+function typeColor(type) {
+    return {Concept:'#3b82f6', Entity:'#8b5cf6', Document:'#f59e0b', Event:'#10b981'}[type] || '#64748b';
+}
+
+/**
+ * 空状态提示
+ */
+function showEmpty() {
+    g.selectAll('*').remove();
+    g.append('text')
+        .attr('x', window.innerWidth/2).attr('y', window.innerHeight/2)
+        .attr('text-anchor', 'middle').attr('fill', '#64748b').attr('font-size', '14px')
+        .text('未找到因果链。请先在主页面搜索或导入记忆。');
+}
+
+/**
+ * 自动缩放适应所有节点的可见范围
+ */
+function autoFit() {
+    const nodes = g.selectAll('.node').data();
+    if(!nodes.length) return;
+    let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+    nodes.forEach(d=>{
+        if(d.fx<minX) minX=d.fx; if(d.fy<minY) minY=d.fy;
+        if(d.fx>maxX) maxX=d.fx; if(d.fy>maxY) maxY=d.fy;
+    });
+    const pad=80, w=maxX-minX+pad*2, hNode=maxY-minY+pad*2;
+    const cvw=window.innerWidth, cvh=window.innerHeight;
+    const sc = Math.min(cvw/w, cvh/hNode, 2);
+    const tx = cvw/2-(minX+maxX)/2*sc;
+    const ty = cvh/2-(minY+maxY)/2*sc;
+    svg.transition().duration(500).attr('viewBox', `${-tx/sc} ${-ty/sc} ${cvw/sc} ${cvh/sc}`);
+}
+
+/**
+ * 转义 HTML 防止 XSS
+ */
+function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+// --- 交互事件 ---
+// 滚轮缩放
+svg.on('wheel', function(e) {
+    e.preventDefault();
+    const curr = svg.attr('viewBox');
+    if(!curr) return;
+    const parts = curr.split(/\s+/).map(Number);
+    if(parts.length!==4) return;
+    const factor = e.deltaY>0 ? 1.1 : 0.9;
+    const nw = parts[2]*factor, nh = parts[3]*factor;
+    const cx = parts[0]+(parts[2]-nw)/2, cy = parts[1]+(parts[3]-nh)/2;
+    svg.attr('viewBox', `${cx} ${cy} ${nw} ${nh}`);
+});
+
+// 窗口大小变化自适应
+window.addEventListener('resize', autoFit);
+
+// --- 启动 ---
+const nodeId = getNodeId();
+loadGraph(nodeId);
+</script>
+</body>
+</html>

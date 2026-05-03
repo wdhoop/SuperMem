@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>超级记忆系统 MVP</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.container{max-width:960px;margin:0 auto;padding:20px}
+h1{font-size:24px;font-weight:600;text-align:center;padding:24px 0 8px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.subtitle{text-align:center;color:#64748b;font-size:13px;margin-bottom:24px}
+.search-box{display:flex;gap:8px;margin-bottom:20px}
+.search-box input{flex:1;padding:10px 14px;border:1px solid #334155;border-radius:8px;background:#1e293b;color:#e2e8f0;font-size:14px;outline:none;transition:border .2s}
+.search-box input:focus{border-color:#60a5fa}
+.search-box button{padding:10px 20px;border:none;border-radius:8px;background:#3b82f6;color:#fff;font-size:14px;cursor:pointer;transition:background .2s}
+.search-box button:hover{background:#2563eb}
+.search-box button:disabled{opacity:.5;cursor:not-allowed}
+.tabs{display:flex;gap:4px;margin-bottom:16px;background:#1e293b;border-radius:8px;padding:4px}
+.tab{flex:1;text-align:center;padding:8px;border-radius:6px;cursor:pointer;font-size:13px;color:#94a3b8;transition:all .2s}
+.tab.active{background:#3b82f6;color:#fff}
+.tab:hover{color:#e2e8f0}
+.card-grid{display:grid;gap:12px}
+.card{background:#1e293b;border-radius:10px;padding:14px;border:1px solid #334155;transition:border .2s;cursor:pointer}
+.card:hover{border-color:#60a5fa}
+.card-title{font-size:15px;font-weight:500;color:#f1f5f9;margin-bottom:4px}
+.card-type{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;margin-bottom:6px}
+.card-type.Concept{background:#3b82f633;color:#60a5fa}
+.card-type.Entity{background:#8b5cf633;color:#a78bfa}
+.card-type.Document{background:#f59e0b33;color:#fbbf24}
+.card-type.Event{background:#10b98133;color:#34d399}
+.card-content{font-size:13px;color:#94a3b8;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.card-meta{display:flex;gap:12px;margin-top:8px;font-size:11px;color:#64748b}
+.card-sim{color:#34d399;font-size:11px;margin-top:4px}
+.import-panel{display:none;background:#1e293b;border-radius:10px;padding:16px;border:1px solid #334155}
+.import-panel.show{display:block}
+.import-panel textarea{width:100%;min-height:120px;padding:10px;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:13px;resize:vertical;outline:none}
+.import-panel textarea:focus{border-color:#60a5fa}
+.import-actions{display:flex;gap:8px;margin-top:10px}
+.import-actions button{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;transition:background .2s}
+.btn-primary{background:#3b82f6;color:#fff}
+.btn-primary:hover{background:#2563eb}
+.btn-secondary{background:#334155;color:#e2e8f0}
+.btn-secondary:hover{background:#475569}
+.empty-state{text-align:center;padding:48px 0;color:#64748b;font-size:14px}
+.loading{text-align:center;padding:24px;color:#64748b;font-size:14px}
+.stats{text-align:center;font-size:12px;color:#64748b;margin-top:8px}
+.stats span{padding:0 8px}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🧠 超级记忆系统</h1>
+<p class="subtitle">Super Memory — 语义记忆存储与推理平台</p>
+
+<div class="tabs">
+<div class="tab active" data-tab="search" onclick="switchTab('search')">🔍 搜索</div>
+<div class="tab" data-tab="import" onclick="switchTab('import')">📥 导入</div>
+</div>
+
+<div class="search-box" id="searchTab">
+<input id="searchInput" placeholder="输入关键词或一句话搜索记忆..." onkeydown="if(event.key==='Enter')search()">
+<button id="searchBtn" onclick="search()">搜索</button>
+</div>
+
+<div class="import-panel" id="importTab">
+<textarea id="importText" placeholder="粘贴文本内容..."></textarea>
+<div class="import-actions">
+<button class="btn-primary" onclick="importText()">导入记忆</button>
+<button class="btn-secondary" onclick="importRandom()">导入示例数据</button>
+</div>
+</div>
+
+<div id="results" class="card-grid"></div>
+<div id="stats" class="stats"></div>
+</div>
+
+<script>
+const API = '/api/v1/memory';
+
+function switchTab(name) {
+    // 切换搜索/导入标签页
+    document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+    document.getElementById('searchTab').style.display = name==='search' ? 'flex' : 'none';
+    document.getElementById('importTab').classList.toggle('show', name==='import');
+    if(name==='search') loadRecent();
+}
+
+async function search() {
+    // 语义搜索，query 为空时显示最近节点
+    const q = document.getElementById('searchInput').value.trim();
+    if(!q) { loadRecent(); return; }
+    const btn = document.getElementById('searchBtn');
+    btn.disabled = true; btn.textContent = '搜索中...';
+    try {
+        const r = await fetch(API+'/search', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,top_k:20})});
+        const d = await r.json();
+        renderCards(d.data || []);
+    } catch(e) { showError('搜索失败: '+e.message); }
+    btn.disabled = false; btn.textContent = '搜索';
+}
+
+async function loadRecent() {
+    // 加载最近记忆：用空 query 搜索（后端返回所有节点）或从 stats 回退
+    document.getElementById('results').innerHTML = '<div class="loading">加载中...</div>';
+    try {
+        const r = await fetch(API+'/search', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:'',top_k:20})});
+        const d = await r.json();
+        if(d.data && d.data.length) { renderCards(d.data); }
+        else { loadFromStats(); }
+    } catch(e) { loadFromStats(); }
+}
+
+async function loadFromStats() {
+    // statistics 回退：无节点时显示空状态提示
+    try {
+        const r = await fetch(API+'/stats');
+        const d = await r.json();
+        if(d.data && d.data.nodes>0) {
+            document.getElementById('results').innerHTML = `<div class="empty-state">共有 ${d.data.nodes} 个节点 · ${d.data.edges} 条边<br>输入关键词开始搜索</div>`;
+        } else {
+            document.getElementById('results').innerHTML = `<div class="empty-state">📭 还没有记忆<br>切换到「导入」标签添加内容</div>`;
+        }
+    } catch(e) { document.getElementById('results').innerHTML = `<div class="empty-state">加载失败</div>`; }
+}
+
+function renderCards(nodes) {
+    // 渲染记忆卡片网格
+    const el = document.getElementById('results');
+    if(!nodes.length) { el.innerHTML = '<div class="empty-state">未找到匹配的记忆</div>'; return; }
+    el.innerHTML = nodes.map(n=>`
+        <div class="card" onclick="viewNode('${n.id}')">
+            <span class="card-type ${n.type}">${n.type}</span>
+            <div class="card-title">${esc(n.name)}</div>
+            <div class="card-content">${esc(n.content||'')}</div>
+            ${n.similarity ? `<div class="card-sim">相关度 ${(n.similarity*100).toFixed(0)}%</div>` : ''}
+            <div class="card-meta"><span>权重 ${n.weight||'1.0'}</span><span>访问 ${n.access_count||0} 次</span><span>${n.created_at||''}</span></div>
+        </div>
+    `).join('');
+}
+
+function viewNode(id) {
+    // 点击卡片在新标签页打开因果链图谱
+    window.open('/graph.html?node='+id, '_blank');
+}
+
+async function importText() {
+    // 导入单条文本到记忆库
+    const txt = document.getElementById('importText').value.trim();
+    if(!txt) { alert('请输入内容'); return; }
+    try {
+        const r = await fetch(API+'/ingest', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:txt,type:'Document',name:txt.slice(0,60)})});
+        const d = await r.json();
+        if(d.code===0) {
+            document.getElementById('importText').value = '';
+            alert('✅ 记忆已保存 (ID: '+d.data.id+')');
+            loadStats();
+        } else { alert('❌ '+d.message); }
+    } catch(e) { alert('导入失败: '+e.message); }
+}
+
+async function importRandom() {
+    // 导入 10 条示例数据，帮助新用户体验系统功能
+    const samples = [ ... ];
+    ...
+}
+
+async function loadStats() {
+    // 刷新底部统计栏
+    try {
+        const r = await fetch(API+'/stats');
+        const d = await r.json();
+        if(d.data) {
+            document.getElementById('stats').innerHTML = `<span>🧠 ${d.data.nodes} 节点</span><span>🔗 ${d.data.edges} 边</span><span>📊 ${d.data.vector_index||0} 向量索引</span>`;
+        }
+    } catch(e) {}
+}
+
+function esc(s) {
+    // 转义 HTML 防止 XSS
+    const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML;
+}
+
+loadStats();
+loadRecent();
+</script>
+</body>
+</html>

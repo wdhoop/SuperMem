@@ -1,55 +1,92 @@
-# 超级记忆系统（SuperMem）
+# 🧠 超级记忆系统 MVP
 
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/wdhoop/SuperMem)
-![GitHub](https://img.shields.io/github/license/wdhoop/SuperMem)
+**Super Memory** — 将散落的知识转化为因果关联的语义记忆系统。
 
-## 项目介绍
+个人知识管理的下一站：不只是存储，更是推理。用向量语义与线性因果链，帮你发现知识间的"为什么"。
 
-SuperMem 是一个基于图数据库与向量检索技术构建的**类人脑语义记忆存储与推理平台**。它能够将散落的知识碎片、对话记录、工作文档等非结构化信息转化为相互关联的语义网络，模拟人类记忆的存储、检索、关联与遗忘过程。
+---
 
-## 核心特性
+## ✨ 核心设计
 
-✅ **三层记忆模型** - 短期/中期/长期三层记忆架构，模拟人脑记忆过程
+| 维度 | 方案 |
+|------|------|
+| 图存储 | SQLite 实现属性图，支持 4 种节点类型（Concept/Entity/Document/Event）、4 种关系（RELATED_TO/PART_OF/CAUSED_BY/MENTIONS） |
+| 向量检索 | ChromaDB + text2vec 本地中文嵌入，支持自然语言语义搜索 |
+| 因果推理 | **线性因果链**，A→B→C 多跳追溯与推导，不展开网状，保持可解释性 |
+| 记忆压缩 | 相似节点自动合并（0.92 阈值）+ 弱边剪枝（<0.15），保持图谱干净 |
+| 遗忘曲线 | 时间衰减（e⁻⁰·⁰⁰¹ᵗ）+ 访问频率加权 |
+| API | 6 个 REST 接口，JSON 统一响应，跨域支持 |
+| Web UI | 纯静态 HTML/CSS/JS，零构建，双击即可打开 |
 
-✅ **因果链推理** - 支持多跳关联发现，自动构建推理路径，从"知道什么"到"理解为什么"
+## 📂 文件结构
 
-✅ **记忆遗忘机制** - 类人脑"用进废退"，记忆强度随时间衰减，高频访问自动强化
+```
+超级记忆系统MVP版/
+├── README.md
+├── requirements.txt        # 依赖清单
+├── server.py               # REST API 服务
+├── core.py                 # 图存储 + 向量索引引擎
+├── web/
+│   ├── index.html          # 主界面：搜索 + 卡片 + 批量导入
+│   └── graph.html          # 线性因果链可视化（D3.js）
+└── temp/                   # 临时辅助脚本（发布时可删）
+```
 
-✅ **Auto-compact 自动压缩** - 智能合并相似节点，剪枝弱关系，保持图谱精简高效
-
-✅ **混合向量检索** - 语义理解 + 模糊检索，P99延迟 < 105ms
-
-## 性能基准
-
-**测试规模：21万+ 节点 / 79万+ 边**
-
-| 测试项目 | 样本量 | 成功率 | P50 | P95 | P99 | QPS |
-|---------|--------|--------|-----|-----|-----|-----|
-| 语义检索 | 1,000 | 90.2% | 41ms | 65ms | 104ms | 24.3 |
-| 节点读取 | 5,000 | 100% | 5ms | 28ms | 42ms | 120.8 |
-
-## 技术栈
-
-- **图数据库**：Neo4j
-- **向量引擎**：FAISS / Milvus
-- **语义模型**：text2vec / OpenAI Embeddings
-- **API接口**：RESTful HTTP
-
-## 快速开始
+## 🚀 快速开始
 
 ```bash
-# 克隆项目
-git clone https://github.com/wdhoop/SuperMem.git
+# 1. 安装依赖
+pip install -r requirements.txt
 
-# 进入目录
-cd SuperMem
+# 2. 启动
+python server.py
 
-# 查看技术文档
-cat 超级记忆系统_MVP技术文档.md
+# 3. 浏览器打开
+http://localhost:8765
+```
 
-# 查看性能测试报告
-cat 超级记忆系统_MVP性能测试报告.md
-##版本说明
-v1.0.0 MVP (2026-05-02) - 核心功能发布，支持图存储、语义检索、Auto-compact、因果链、遗忘机制
-##许可证
-MIT License - Copyright (c) 2026 Chi Qian
+> 首次启动会自动下载中文向量模型（~300MB），需联网。
+
+## 📡 API 接口
+
+### POST /api/v1/memory/ingest — 写入记忆
+```json
+{"content": "Python 是一种动态类型语言", "type": "Concept", "name": "Python"}
+```
+
+### POST /api/v1/memory/search — 语义搜索
+```json
+{"query": "动态语言", "top_k": 10}
+```
+
+### GET /api/v1/memory/node/{id} — 节点详情
+### GET /api/v1/memory/graph?node_id={id}&depth=3 — 线性因果链
+### GET /api/v1/memory/stats — 系统统计
+### POST /api/v1/memory/compact — 手动压缩
+
+## 🧩 线性因果链
+
+核心设计原则：**路径不网状**。当查询一个节点时，沿 `CAUSED_BY` 边向前追溯原因、向后推导后果，形成一条清晰的线性路径：
+
+```
+[原因] → [事件] → [后果]
+   ↓
+[深层次原因] → [事件] → [深层后果]
+```
+
+图谱 UI 使用 D3.js 实现，x 轴线性排列，滚轮缩放，点击节点跳转。
+
+## ⚙️ 配置
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `PORT` | 8765 | 服务端口 |
+| `SUPER_MEMORY_DB` | `super_memory.db` | 数据库路径 |
+
+## 📜 开源协议
+
+MIT License — 自由使用、修改、分发。
+
+---
+
+*从碎片到关联，从关联到因果。*
