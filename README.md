@@ -1,5 +1,12 @@
 # 超级记忆系统 MVP (Super Memory MVP)
 
+V1.0.1更新
+增加心跳任务。
+让模型自动提取对话内容。
+heartbeat-setup.pdf
+heartbeat-philosophy.pdf
+
+V1.0.0
 一个轻量级、零依赖的**结构化记忆系统** —— 基于属性图存储 + 语义向量检索 + 遗忘曲线，模拟人类记忆的存储、关联与遗忘机制。
 
 ## 项目结构
