@@ -1,3 +1,7 @@
-chromadb>=0.5.0
-sentence-transformers>=2.2.0
-numpy>=1.24.0
+# SuperMem 依赖（Python 3.10+）
+# 核心逻辑仅依赖标准库；以下为向量索引 / embedding / 评测所需
+chromadb>=1.5
+transformers>=4.40
+torch>=2.2
+numpy>=1.24
+requests>=2.31        # 仅 benchmark/ 评测脚本需要（QA 循环与 LLM-Judge）

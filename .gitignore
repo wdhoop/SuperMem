@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地存储（数据库 / 向量索引 / 模型 / 备份 / 日志）
+storage/
+*.log
+
+# LoCoMo 评测数据与隔离库（用户自备，不入库）
+benchmark/data/
+benchmark/db/

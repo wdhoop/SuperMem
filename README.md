@@ -1,107 +1,162 @@
-# 超级记忆系统 MVP (Super Memory MVP)
+# SuperMem 超级记忆系统
 
-V1.0.1更新
-增加心跳任务。
-让模型自动提取对话内容。
-heartbeat-setup.pdf
-heartbeat-philosophy.pdf
+**本地优先、图结构 + 向量 + 原文三层的长期记忆系统**，为 AI 智能体（LLM / 数字人 / 桌面宠物）提供可检索、可演化的持久记忆底座。
 
-V1.0.0
-一个轻量级、零依赖的**结构化记忆系统** —— 基于属性图存储 + 语义向量检索 + 遗忘曲线，模拟人类记忆的存储、关联与遗忘机制。
+SuperMem 把"记忆"当作一等公民：写入时自动提取实体/事件/规则、构建因果与语义边；检索时融合图检索 + 向量检索 + 原文层强召回；运行时由生命周期管理器自动完成节点状态流转、去重、遗忘与归档。核心逻辑**零第三方框架依赖**（仅向量索引依赖 ChromaDB），可嵌入任意 LLM 应用。
 
-## 项目结构
+---
 
-```
-超级记忆系统MVP版/
-├── core.py          # 核心引擎：图存储 + ChromaDB 向量检索
-├── server.py        # REST API 服务（stdlib http.server，零外部依赖）
-├── requirements.txt # 可选依赖（仅向量搜索需要 chromadb）
-├── README.md        # 本文件
-└── web/
-    ├── index.html   # 主界面：语义搜索 + 记忆卡片 + 批量导入
-    └── graph.html   # 线性因果链可视化（D3.js）
-```
+## 特性
 
-## 核心特性
+- **三层记忆架构**
+  - **图层**：SQLite 存储 nodes/edges，节点带类型（概念/实体/事件/文档/规则…）、权重分区（Core / Working / Cold）、时间戳，边带因果/时序/语义类型与强度。
+  - **向量层**：ChromaDB + BGE embedding，cosine 相似度检索，支持本地模型目录。
+  - **原文层（verbatim）**：写入内容逐字落库，带独立向量索引，供"强召回下探"——当图检索置信不足时自动下探原文，实测对 LoCoMo 难题组带来稳定 +25~28% 增益。
+- **融合检索 `search_strong`**：图检索 + 向量检索 + 原文下探 + 时间窗过滤 + 因果链扩展，一次调用返回结构化上下文。
+- **自动提取与建边**：规则提取器、事件归一化、跨会话聚合、相似节点自动建语义边、因果边自动推导。
+- **生命周期管理**：节点状态机（候选/活跃/确认/过时/废弃）、权重衰减与升温、遗忘阈值、存档与备份。
+- **调度与中断预算**：定时回收、批量写入合并、中断预算（interrupt budget）避免高频打断，Hot Cache 提速热词检索。
+- **REST API**：`http.server` 标准库实现，零 Web 框架依赖，Token 认证，默认只绑定 127.0.0.1。
+- **MCP 服务**：可选启动 MCP Server，供 Claude / 其他 MCP 客户端直接读写记忆。
+- **CLI 桥接 `bridge/smem.py`**：健康检查 / 写入 / 语义检索 / 时间旅行 / 状态流转，内置服务自愈（服务未启动时自动拉起）。
 
-### 1. 属性图存储
-- 以节点（事件/概念/任务/决策等）和边（因果关系/触发/阻塞等）构建知识图谱
-- 完全基于 SQLite，零外部依赖
-
-### 2. 语义向量检索
-- 基于 ChromaDB + text2vec-base-chinese 实现中文语义搜索
-- 自动为每个节点生成向量索引
-
-### 3. 遗忘曲线
-- 基于指数衰减的权重公式，模拟人类遗忘规律
-- 按节点类型差异化衰减速度（决策类慢、事件类标准）
-- 因果因子：关联边越多越难遗忘
-- 定期 compact 机制自动剪枝低权重节点
-
-### 4. 线性因果链
-- 沿 `CAUSED_BY` 关系双向追溯（原因 + 后果）
-- 支持指定深度追溯，生成可读的因果路径
-
-### 5. 相似节点合并
-- 语义相似度检测 + 自动合并
-- 保留高权重节点，继承所有关联边
-
-### 6. Web 管理界面
-- 记忆卡片浏览与搜索
-- 批量导入文本
-- 线性因果链可视化（D3.js 力导向图）
+---
 
 ## 快速开始
 
+### 1. 安装
+
 ```bash
-# 1. 安装可选依赖（如需要语义搜索）
+# Python 3.10+
 pip install -r requirements.txt
-
-# 2. 直接运行 REST API 服务
-python server.py
-
-# 3. 在浏览器打开
-# http://localhost:8765
 ```
 
-首次运行会自动创建 `super_memory.db`，系统即可使用。
+首次启动会自动下载/加载 embedding 模型（默认 `BAAI/bge-small-zh-v1.5`，可改 `config.py` 中的 `EMBED_MODEL_NAME` 与 `MODELS_DIR`）。
 
-> **注意**：本项目是一个**框架级开源项目结构**，提供核心功能代码。部分依赖（如 chromadb、text2vec 模型）需自行安装配置。详见部署文档。
+### 2. 配置访问令牌
 
-## API 文档
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/` | Web 管理界面 |
-| GET | `/graph.html` | 因果链可视化 |
-| GET | `/api/v1/memory/stats` | 系统统计 |
-| GET | `/api/v1/memory/graph?node_id=&depth=` | 线性因果链 |
-| GET | `/api/v1/memory/node/{id}` | 节点详情 |
-| POST | `/api/v1/memory/ingest` | 写入记忆 |
-| POST | `/api/v1/memory/search` | 语义检索 |
-| POST | `/api/v1/memory/compact` | 手动压缩 |
-
-## 遗忘公式
-
-```
-W(t) = e^(-0.00022 × t)
-
-  t = 距创建时间的小时数
-  约 1 年不访问 → weight 降至 0.15，可被剪枝
+```bash
+# 启动前设置你自己的令牌（生产/公网使用必须配置）
+set SUPERMEM_API_TOKEN=your-own-token        # Windows
+export SUPERMEM_API_TOKEN=your-own-token     # Linux/macOS
 ```
 
-每次访问权重 +0.05（上限 1.0），20 次封顶。访问可重置遗忘进程。
+未设置时使用 `config.py` 中的占位值 `change-me`（仅限本地调试）。
 
-## 边类型定义（开发概念系统）
+### 3. 启动服务
 
-| 类型 | 语义 | 说明 |
-|------|------|------|
-| `CAUSED_BY` | A → B：A 的原因是 B | 线性因果链核心。A `caused_by` B 表示 A 的成因是 B |
-| `LEADS_TO` | A → B：A 导致 B | 主动性因果关系。A 的结果/影响是 B |
-| `RELATES_TO` | A — B：A 与 B 相关 | 弱关联，无方向性。用于构建关联网络 |
-| `DEPENDS_ON` | A → B：A 依赖于 B | 依赖关系。A 的实现/存在依赖于 B |
-| `SIMILAR_TO` | A — B：A 与 B 相似 | 语义相似但不完全相同。合并候选 |
+```bash
+python main.py          # 启动 REST API（默认 http://127.0.0.1:18766）
+# 可选：python mcp_server.py  # 启动 MCP Server
+# 可选：python scripts/watchdog.py  # 看门狗：服务异常自动拉起
+```
+
+### 4. 使用 CLI 写入与检索
+
+```bash
+python bridge/smem.py health
+python bridge/smem.py add "今天完成了桥接，决定让豆包助手直接读写本地记忆。" --type decision --source myapp
+python bridge/smem.py search "桥接方案" --limit 5
+python bridge/smem.py rewind "2026-09-30 12:00" "桥接方案"     # 时间旅行：某时刻视角下的记忆
+python bridge/smem.py mark <node_id> confirmed                 # 状态流转
+```
+
+### 5. REST API 示例
+
+```bash
+# 写入（自动建边 + 自动落原文层）
+curl -X POST http://127.0.0.1:18766/nodes \
+  -H "Authorization: Bearer $SUPERMEM_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"项目定于下周一上线，风险点是数据库迁移。","project":"myapp","source":"myapp","tags":["上线","迁移"]}'
+
+# 批量提取（自动识别规则/事件/心得，可带 nodes/edges）
+curl -X POST http://127.0.0.1:18766/extract \
+  -H "Authorization: Bearer $SUPERMEM_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"今天完成了桥接，决定让豆包助手直接读写本地记忆。","source":"myapp","project":"myapp"}'
+
+# 融合检索（图检索 + 向量 + 原文层强召回）
+curl "http://127.0.0.1:18766/search/strong/%E6%95%B0%E6%8D%AE%E5%BA%93%E8%BF%81%E7%A7%BB%20%E9%A3%8E%E9%99%A9?limit=10"
+
+# 健康检查
+curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN"
+```
+
+更多端点：`GET /search/<query>`（普通检索）、`GET /nodes?q=`（节点搜索/列表）、`GET /rewind/<ts>/<query>`（时间旅行）、`GET /timeline/<start>/<end>`（时间线）、`POST /mark`（状态流转）、`POST /decay`（权重衰减）、`POST /selfcheck`（健康自检）、`POST /rebuild`（重建向量索引）、`POST /backup`（备份）。
+
+---
+
+## 架构概览
+
+```
+写入链路：extract → rule_extractor / event_normalizer → core(Node) → add_node_with_vector
+          → linker(auto_link 建边) → verbatim 原文落库 → memory_updater / cross_session
+
+检索链路：search_strong(融合) = 图检索 + 向量检索
+          → 置信不足时下探原文层（verbatim 强召回）
+          → 时间窗过滤 + 因果链扩展 → 权重分区排序输出
+
+生命周期：node_lifecycle / edge_lifecycle（状态机、衰减、遗忘）
+          + priority_queue（回收队列）+ scheduler（定时任务）
+          + interrupt_budget（中断预算）+ hot_cache（热词缓存）
+          + metrics（统计）+ cycle_detector（循环检测）
+```
+
+- `core.py`：图存储（GraphStore）、向量检索（VectorSearch）、因果引擎（CausalEngine）、记忆系统（MemorySystem）
+- `search_fusion.py`：融合检索主入口
+- `api.py` / `main.py`：REST 服务与启动入口
+- `scheduler.py`：后台定时任务（回收、备份、清理）
+- `mcp_server.py`：MCP 协议服务（可选）
+
+---
+
+## 基准评测（LoCoMo）
+
+在 **LoCoMo 官方基准**（10 段超长多会话对话 / 1986 道 QA / 五类推理）上完成全量评测：
+本地隔离库（零接触生产库）构建，官方 F1 + LLM-Judge accuracy 双口径，**脚本与结果全部随仓库公开、可复现**。
+
+| 作答模型 | limit24 Token F1 | LLM-Judge Accuracy |
+|---|---|---|
+| 9B（qwen3.5:9b, 本地） | 0.4083 | 0.5504 |
+| 27B（qwen3.8-27b-fast, 本地） | 0.4313 | 0.5821 |
+| 125B（Qwen3.8-Flash-Next, Strata 本地） | **0.4585** | **0.6163** |
+
+关键发现：
+- **检索供给是瓶颈，模型 × 供给是乘法关系**：limit 8→24 时证据命中 65.8%→82.2%，F1 三档同步 +6~8pp（9B +6.4 / 27B +6.9 / 125B +7.7），模型越大增益越大。
+- **原文层强召回是有效增量**：触发原文下探（hybrid）的难题组，F1 稳定高出图检索组 +25~28%（三个 answerer 下均复现）。
+- 分类别 125B：multi-hop 0.6175 / adversarial 0.4359 / single-hop 0.4048 / commonsense 0.3552 / temporal 0.1515。
+
+完整方法论、口径声明与社区对比见 [`benchmark/README.md`](benchmark/README.md) 与 [`docs/LoCoMo评测报告.md`](docs/LoCoMo评测报告.md)。
+
+---
+
+## 目录结构
+
+```
+SuperMem/
+├── core.py / api.py / main.py / config.py   # 核心 + 服务 + 入口 + 配置
+├── search_fusion.py / linker.py / extract.py
+├── rule_extractor.py / event_normalizer.py / memory_updater.py
+├── node_lifecycle.py / edge_lifecycle.py / cycle_detector.py
+├── time_window.py / cross_session.py / priority_queue.py
+├── interrupt_budget.py / hot_cache.py / metrics.py
+├── scheduler.py / mcp_server.py / analyze_patterns.py
+├── bridge/smem.py              # CLI 桥接
+├── scripts/                    # selfcheck / rebuild_vector_index / watchdog
+├── web/                        # 简版可视化面板（搜索 + 图谱）
+├── benchmark/                  # LoCoMo 评测（脚本 + 结果 + README）
+└── docs/                       # 架构说明 + 评测报告
+```
+
+---
 
 ## 许可证
 
-MIT
+[MIT](LICENSE) © 2026 Chi Qian
+
+## 致谢
+
+- 向量索引：[ChromaDB](https://github.com/chroma-core/chroma)
+- Embedding：[BAAI/bge-small-zh-v1.5](https://huggingface.co/BAAI/bge-small-zh-v1.5)（评测用 bge-small-en-v1.5）
+- 基准：[Snap Research LoCoMo](https://github.com/snap-research/LoCoMo)
