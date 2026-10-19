@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 超级记忆系统 —— 统一配置
 按《超级记忆系统-架构说明书》(2026-09-30) 重建。
@@ -21,8 +21,6 @@ SELFCHECK_LOG_DIR = os.path.join(STORAGE_DIR, "selfcheck_logs")
 # ---- 服务（[FIX] 默认只绑定本机 + Token 认证）----
 HOST = "127.0.0.1"
 PORT = 18766  # 原架构 8765 被本机百度输入法占用；18765 被 pythonw 占用，均避开
-# 启动前请设置环境变量 SUPERMEM_API_TOKEN 指定你自己的访问令牌；
-# 未设置时使用下方占位值（仅限本地调试，生产/公网使用必须显式配置）。
 API_TOKEN = os.environ.get("SUPERMEM_API_TOKEN", "change-me")
 
 # ---- 向量索引 ----
@@ -86,6 +84,19 @@ VERBATIM_STRONG_TOP_K = 5                       # 原文强召回条数
 VERBATIM_QUERY_FETCH = 500                      # 原文向量检索原始召回面（HNSW 近似漏召修复：拉大检索面后客户端精确重排）
 VERBATIM_MAX_LEN = 4000                         # 单块原文最大字符数（超出自动截断落块）
 
+# ---- 联想检索 assoc（2026-10-19 评测回写：LoCoMo-Plus 联想桥 / HyDE query 扩展）----
+# 可选增强：强召回时用"无思考模式"LLM 生成联想句扩展查询（评测实证：在隐藏抽象关联
+# 基准上检索供给能力翻倍，causal/goal/value 全覆盖 +23~43 点）。这是检索管线加
+# LLM query 生成的策略升级（HyDE 同类），不是对记忆图谱本身的改动。
+# 不配置（ASSOC_ENABLED=False 或端点为空）则完全关闭，检索行为与旧版完全一致。
+ASSOC_ENABLED = False                          # 总开关（默认关，不改变现有行为）
+ASSOC_ENDPOINT = ""                            # OpenAI 兼容端点，如 https://api.deepseek.com/v1
+ASSOC_KEY = ""                                 # API key（留空则关闭）
+ASSOC_MODEL = "deepseek-chat"                  # 无思考模式档（评测实证：比推理档快 30 倍且质量更好）
+ASSOC_TIMEOUT = 20                             # 单次联想生成超时（秒）
+ASSOC_N = 4                                    # 联想句条数（评测默认 8，生产取 4 平衡延迟与增益）
+ASSOC_MAX_QUERY_LEN = 400                      # trigger 超长截断（字符）
+
 # ---- 状态机（说明书 §五）----
 STATUSES = ["active", "confirmed", "permanent", "hypothesis",
             "outdated", "obsolete", "disputed", "merged"]
@@ -117,3 +128,4 @@ NODE_TYPES = ["event", "insight", "reference", "material", "decision", "techniqu
 EDGE_TYPES = ["part_of", "derives_insight", "applies", "improves", "evolves_from",
               "shares_theme_with", "related", "merged_into", "replaced_by", "uses_rule",
               "contains_technique", "refutes"]
+

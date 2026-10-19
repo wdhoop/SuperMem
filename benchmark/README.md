@@ -116,3 +116,48 @@ Judge 协议（同官方）：语义等价判对；`unknown` 一律判错；只�
 2. **本评测是纯检索片段 + 本地模型作答**，无 oracle、无近全量上下文；社区高分（92%+）普遍使用 GPT-4 级 answerer 或 oracle 检索，条件不同。
 3. **题数口径**：官方 10 段全量 1986 题；部分社区自报用 1540 题子集。
 4. LoCoMo **无官方统一排行榜**，社区成绩均为自报，且存在造假争议——本包以"脚本 + 逐题结果全公开"保证可复现。
+
+---
+
+## 五、LoCoMo-Plus 评测（v1.0.1 随包新增）
+
+**LoCoMo-Plus** 是西安交大认知记忆基准（401 题：causal 101 / state 100 / goal 100 / value 100），聚焦隐藏抽象关联（跨时间因果、目标、价值观）的回忆能力。
+
+### 复现步骤
+
+```bash
+# 0. 准备数据：官方 locomo_plus.json（含每样本多轮对话 + 前提问题）放入
+#    benchmark/locomo_plus_data/locomo_plus.json（或用 LOCOMO_PLUS_JSON 环境变量指定）
+
+# 1. 建隔离库（401 个独立库，生产版完整架构复刻）
+set LOCOMO_PLUS_DATA=benchmark/locomo_plus_data
+python benchmark/scripts/locomo_plus/ingest_locomo_plus_par.py
+
+# 2. 生成联想句（无思考模式，需 DeepSeek 或其他 OpenAI 兼容 API）
+set DEEPSEEK_API_KEY=sk-xxx
+python benchmark/scripts/locomo_plus/bridge_assoc_v2_full_chat.py
+
+# 3. 跑评测（给前提 + 基于记忆回答；answerer 默认 DeepSeek V4-flash）
+python benchmark/scripts/locomo_plus/bridge_eval_v4_full_chat.py
+
+# 4. judge 判定 + 补判（parse_fail 清零）
+python benchmark/scripts/locomo_plus/judge_bridge_v4_full_chat.py
+python benchmark/scripts/locomo_plus/judge_fix_parsed_chat.py
+```
+
+### 结果文件（`results/locomo_plus/`，已随包发布）
+
+| 文件 | 内容 |
+|---|---|
+| `bridge_assoc_v2_full_chat.jsonl` | 401×8 联想句（统一口径定稿） |
+| `bridge_judged_v4_full_chat.jsonl` | **定稿 judge 结果：224/401 = 55.86%** |
+| `bridge_judged_base_full.jsonl` | 纯系统基线 judge：101/401 = 25.19% |
+| `bridge_judged_graphx.jsonl` | 图遍历对照 judge：106/401 = 26.43% |
+| `bridge_judged_gv.jsonl` / `bridge_judged_value16.jsonl` | goal/value 专项实验 judge |
+
+### 口径声明
+
+1. **只给检索片段、不给完整对话**（模拟真实记忆系统回忆使用方式），比官方"全量供给"更严苛。
+2. 官方 61.6 是"模型看完整对话推理"上限；本评测 55.86% 是"记忆系统回忆供给"能力，达成度 91%。
+3. 联想桥 = 检索管线 + LLM query 生成（HyDE 同类），30.7 点增益全部来自检索策略升级。
+4. goal/value 短板与失败实验（value 强化 2.0 等）全部如实公开，见 [`../docs/LoCoMo-Plus评测报告.md`](../docs/LoCoMo-Plus评测报告.md)。

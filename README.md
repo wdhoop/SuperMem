@@ -2,6 +2,8 @@
 
 **本地优先、图结构 + 向量 + 原文三层的长期记忆系统**，为 AI 智能体（LLM / 数字人 / 桌面宠物）提供可检索、可演化的持久记忆底座。
 
+> **v1.0.1（2026-10-19）**：新增**联想检索**（associative retrieval，可选增强）——检索时用无思考模式 LLM 生成联想句扩展查询（HyDE 同类），LoCoMo-Plus 基准实测检索供给翻倍（25.19% → 55.86%）；随包发布 LoCoMo-Plus 全量评测（401 题，脚本+结果全公开）。详见 [CHANGELOG](CHANGELOG.md)。
+
 SuperMem 把"记忆"当作一等公民：写入时自动提取实体/事件/规则、构建因果与语义边；检索时融合图检索 + 向量检索 + 原文层强召回；运行时由生命周期管理器自动完成节点状态流转、去重、遗忘与归档。核心逻辑**零第三方框架依赖**（仅向量索引依赖 ChromaDB），可嵌入任意 LLM 应用。
 
 ---
@@ -13,6 +15,7 @@ SuperMem 把"记忆"当作一等公民：写入时自动提取实体/事件/规�
   - **向量层**：ChromaDB + BGE embedding，cosine 相似度检索，支持本地模型目录。
   - **原文层（verbatim）**：写入内容逐字落库，带独立向量索引，供"强召回下探"——当图检索置信不足时自动下探原文，实测对 LoCoMo 难题组带来稳定 +25~28% 增益。
 - **融合检索 `search_strong`**：图检索 + 向量检索 + 原文下探 + 时间窗过滤 + 因果链扩展，一次调用返回结构化上下文。
+- **联想检索（v1.0.1，可选）**：`search_strong(..., expand=True)` 用无思考模式 LLM 生成联想句扩展查询（HyDE / query-expansion 同类），把"字面检索不到但语义相关"的记忆捞出来；默认关闭、未配置时静默回退，旧行为完全不变。
 - **自动提取与建边**：规则提取器、事件归一化、跨会话聚合、相似节点自动建语义边、因果边自动推导。
 - **生命周期管理**：节点状态机（候选/活跃/确认/过时/废弃）、权重衰减与升温、遗忘阈值、存档与备份。
 - **调度与中断预算**：定时回收、批量写入合并、中断预算（interrupt budget）避免高频打断，Hot Cache 提速热词检索。
@@ -94,6 +97,7 @@ curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN
           → linker(auto_link 建边) → verbatim 原文落库 → memory_updater / cross_session
 
 检索链路：search_strong(融合) = 图检索 + 向量检索
+          →（可选 v1.0.1）联想检索 expand：无思考模式 LLM 生成联想句扩展召回
           → 置信不足时下探原文层（verbatim 强召回）
           → 时间窗过滤 + 因果链扩展 → 权重分区排序输出
 
@@ -131,6 +135,24 @@ curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN
 
 ---
 
+## 基准评测（LoCoMo-Plus，v1.0.1 随包发布）
+
+在 **LoCoMo-Plus 基准**（西安交大认知记忆基准，401 题：causal 101 / state 100 / goal 100 / value 100）上完成全量评测，回答模型为 DeepSeek V4-flash。评测口径：**只给检索片段、不给完整对话**（模拟真实记忆系统的回忆使用方式），比官方"全量供给"更严苛。
+
+| 检索策略 | 成绩 | 含义 |
+|---|---|---|
+| 纯系统检索（无增强） | **25.19%** | 记忆系统自身（向量+图谱+原文层）真实底分 |
+| 纯检索 + 图遍历扩展 | 26.43% | 系统静态检索策略上限（+1.2 点，几乎无增益） |
+| **联想桥（检索策略升级）** | **55.86%** | 检索管线加 LLM query 生成（HyDE 同类），**达成官方参考 61.6 的 91%** |
+
+- **30.7 个点的增益全部来自检索策略升级**（联想桥），不是静态图谱遍历能替代的（图遍历对照仅 +1.2 点）。
+- 分类型：causal 77.2% / state 69% / goal 37% / value 40%；goal/value 是公认难点，短板与失败实验全部如实公开。
+- 该评测的最大成果（联想检索）已回写生产成为 **v1.0.1 核心新能力**，配置 `ASSOC_ENABLED=True` + OpenAI 兼容端点即可启用。
+
+完整报告：[`docs/LoCoMo-Plus评测报告.md`](docs/LoCoMo-Plus评测报告.md)；脚本与结果：`benchmark/scripts/locomo_plus/`、`benchmark/results/locomo_plus/`（可复现）。
+
+---
+
 ## 目录结构
 
 ```
@@ -143,10 +165,12 @@ SuperMem/
 ├── interrupt_budget.py / hot_cache.py / metrics.py
 ├── scheduler.py / mcp_server.py / analyze_patterns.py
 ├── bridge/smem.py              # CLI 桥接
-├── scripts/                    # selfcheck / rebuild_vector_index / watchdog
+├── scripts/                    # selfcheck / rebuild_vector_index / watchdog / verify_assoc_backport
 ├── web/                        # 简版可视化面板（搜索 + 图谱）
-├── benchmark/                  # LoCoMo 评测（脚本 + 结果 + README）
-└── docs/                       # 架构说明 + 评测报告
+├── benchmark/                  # LoCoMo 评测 + LoCoMo-Plus 评测（脚本 + 结果 + README）
+│   ├── scripts/locomo_plus/    #   LoCoMo-Plus：ingest → 联想生成 → 评测 → judge
+│   └── results/locomo_plus/    #   LoCoMo-Plus：联想句 / 评测结果 / judge 结果（JSONL）
+└── docs/                       # 架构说明 + LoCoMo 评测报告 + LoCoMo-Plus 评测报告
 ```
 
 ---

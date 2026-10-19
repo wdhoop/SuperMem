@@ -9,13 +9,82 @@
   ② RRF 融合：三路各自排名，score += 1/(60+rank)，哪路排得靠前贡献越大
   ③ 时间加成：越新的节点分越高（1 - 0.01/天，最低 0.2 保底）
 统一为单管线，所有检索入口（/search、/nodes?q=、/rewind）共用。
+[UPD 2026-10-19] 联想检索（assoc，评测回写）：可选增强——强召回时用无思考模式
+  LLM 生成联想句扩展查询，与原查询合并召回（HyDE / query-expansion 同类）。
+  LoCoMo-Plus 评测实证：隐藏抽象关联（因果/目标/价值观）下检索供给翻倍（25%→56%）。
+  默认关闭（config.ASSOC_ENABLED=False），未配置/生成失败时静默回退原检索，行为不变。
 """
+import json
 import math
 import re
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 import config
 from core import MemorySystem
+
+# 联想句生成 prompt（评测四角度精简版；无思考模式模型，输出 JSON 数组）
+_ASSOC_PROMPT = (
+    "You are helping an AI memory system retrieve relevant past memories. "
+    "A person (A) is now saying: \"{q}\". "
+    "Imagine what A might have mentioned in PAST conversations (weeks or months ago) "
+    "that relates to this statement. Do NOT stay on the literal surface; dig one layer deeper. "
+    "Cover these angles: 1) a past cause/trigger event; 2) a persistent physical or emotional state; "
+    "3) a long-term goal/plan; 4) a core value/principle. "
+    "Write {n} first-person (\"I ...\") hypothetical past sentences, specific and concrete. "
+    "Output strictly as a JSON array of {n} strings, nothing before or after."
+)
+
+
+def _assoc_enabled():
+    return bool(config.ASSOC_ENABLED and config.ASSOC_ENDPOINT and config.ASSOC_KEY)
+
+
+def _assoc_call(q):
+    """调用无思考模式 LLM 生成联想句；失败/超时/空返回 []（调用方静默回退）。"""
+    q = (q or "").strip()
+    if not q:
+        return []
+    if len(q) > config.ASSOC_MAX_QUERY_LEN:
+        q = q[:config.ASSOC_MAX_QUERY_LEN]
+    payload = {
+        "model": config.ASSOC_MODEL,
+        "messages": [{"role": "user", "content": _ASSOC_PROMPT.format(q=q, n=config.ASSOC_N)}],
+        "max_tokens": 600,
+        "temperature": 0.9,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        config.ASSOC_ENDPOINT.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + config.ASSOC_KEY},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=config.ASSOC_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+        if not content:
+            return []
+        i, j = content.find("["), content.rfind("]")
+        if i >= 0 and j > i:
+            arr = json.loads(content[i:j + 1])
+            if isinstance(arr, list):
+                out = [str(x).strip() for x in arr if str(x).strip()][:config.ASSOC_N]
+                return out
+        strs = re.findall(r'"((?:[^"\\]|\\.)*)"', content)
+        return [s.strip() for s in strs if s.strip()][:config.ASSOC_N]
+    except Exception:
+        return []
+
+
+def gen_assoc_queries(q):
+    """对外：生成联想查询句（供测试/接入方调用）。未配置或失败返回 []。"""
+    if not _assoc_enabled():
+        return []
+    return _assoc_call(q)
 
 
 def _recency_score(node):
@@ -92,14 +161,16 @@ def _time_bonus(node):
     return max(0.2, 1.0 - days * 0.01)
 
 
-def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K):
-    """并行三路召回 + RRF 融合 + 时间加成，返回候选（已按融合分排序）。"""
+def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_queries=None):
+    """并行三路召回 + RRF 融合 + 时间加成，返回候选（已按融合分排序）。
+    assoc_queries: 联想句列表（可选）——每条联想句额外参与 vector/fts 召回并合并 RRF，
+    扩大跨时间/跨粒度的召回面（评测回写，默认 None 时行为与旧版完全一致）。"""
     cands = {}
 
     def ensure(nid, node):
         if nid not in cands:
             cands[nid] = {"node": node, "vector_score": 0.0, "fts_score": 0.0,
-                          "causal": 0, "rrf": 0.0, "time_bonus": 1.0,
+                          "causal": 0, "assoc": 0, "rrf": 0.0, "time_bonus": 1.0,
                           "recall_score": 0.0}
         return cands[nid]
 
@@ -124,6 +195,28 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K):
         rec = ensure(node.id, node)
         rec["fts_score"] = fs
         rec["rrf"] += 1.0 / (60.0 + fts_rank)
+
+    # ④ assoc 联想路（可选）：每条联想句走 vector+fts，命中并入 RRF（带 assoc 标记）
+    assoc_rank = 0
+    for aq in (assoc_queries or []):
+        aq = (aq or "").strip()
+        if not aq:
+            continue
+        for hit in ms.vector.query(aq, top_k=config.RECALL_TOP_K, where=where):
+            node = ms.graph.get_node(hit["id"])
+            if not node or node.status == "obsolete":
+                continue
+            assoc_rank += 1
+            rec = ensure(hit["id"], node)
+            rec["assoc"] += 1
+            rec["rrf"] += 1.0 / (60.0 + assoc_rank)
+        for node, fs in _fts_recall(ms, aq, project=project, top_k=config.RECALL_TOP_K):
+            if node.status == "obsolete":
+                continue
+            assoc_rank += 1
+            rec = ensure(node.id, node)
+            rec["assoc"] += 1
+            rec["rrf"] += 1.0 / (60.0 + assoc_rank)
 
     # ③ causal 因果路：从 vector/fts 各自 top 10 种子沿因果边扩散 1 层
     seen_seed = set()
@@ -183,12 +276,18 @@ def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=T
     return {"query": q, "limit": limit, "engine": "recall+rrf(V6,3路)", "results": results}
 
 
-def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_raw=False):
+def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_raw=False, expand=False):
     """强召回检索（2026-10-17 原文层）：先走三路召回+RRF；
     当图 top1 向量距离过远（语义不够近）、融合分极端低、无结果、或显式 force_raw 时，
     下探原文层（verbatim 向量）逐字召回，返回原文块 + 关联节点，带出处。
-    日常检索（search/nodes_query）不触碰原文层。"""
-    cands = recall_candidates(ms, q, project=project)
+    日常检索（search/nodes_query）不触碰原文层。
+    expand=True（2026-10-19 评测回写）：额外启用联想检索——生成联想句扩展召回面，
+    未配置 config.ASSOC_* 或生成失败时静默回退，与 expand=False 结果一致。"""
+    assoc_queries = []
+    if expand and _assoc_enabled():
+        assoc_queries = _assoc_call(q)
+
+    cands = recall_candidates(ms, q, project=project, assoc_queries=assoc_queries)
     top = rerank(ms, cands, top_n=limit)
     results = []
     for c in top:
@@ -234,8 +333,10 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
             mode = "verbatim" if not results else "hybrid"
         elif not results:
             mode = "none"
-    return {"query": q, "mode": mode, "engine": "recall+rrf→verbatim(强召回)",
-            "results": results, "raw": raw}
+    if assoc_queries:
+        mode = mode + "+assoc"
+    return {"query": q, "mode": mode, "engine": "recall+rrf→verbatim(强召回,assoc可选)",
+            "results": results, "raw": raw, "assoc_queries": assoc_queries}
 
 
 def nodes_query(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None):
