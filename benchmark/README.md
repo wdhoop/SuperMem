@@ -108,8 +108,6 @@ Judge 协议（同官方）：语义等价判对；`unknown` 一律判错；只�
 
 成绩汇总与社区对比见 [`../docs/LoCoMo评测报告.md`](../docs/LoCoMo评测报告.md)。
 
----
-
 ## 四、口径声明（重要）
 
 1. **F1 与 accuracy 不可直接对比**：社区主流报 LLM-Judge accuracy（GPT-4 级 judge、语义等价判对）；F1 是词面 token 重叠，数值天然偏低。
@@ -161,3 +159,43 @@ python benchmark/scripts/locomo_plus/judge_fix_parsed_chat.py
 2. 官方评测是"模型看完整对话推理"（全量供给、三档 judge 含 0.5 分），最高分 Gemini 2.5 Pro 45.72%；本评测 55.86% 是"记忆系统回忆供给"（只给检索片段、严格二档 judge），**反超官方最高分 10.1 个点**。（早前流传的"官方 61.6"经核实无官方出处，已弃用。）
 3. 联想桥 = 检索管线 + LLM query 生成（HyDE 同类），30.7 点增益全部来自检索策略升级。
 4. goal/value 短板与失败实验（value 强化 2.0 等）全部如实公开，见 [`../docs/LoCoMo-Plus评测报告.md`](../docs/LoCoMo-Plus评测报告.md)。
+
+---
+
+## 六、全上下文天花板对照（v1.0.2 随包新增）
+
+为给"记忆系统相对理论上限的提升幅度"一个可对外的可比锚点，补跑**全量供给对照**：
+同一模型（Qwen3.8-Flash-Next **IQ3_S**，本地 Strata 引擎）、同一 judge（DeepSeek V4-Flash，
+官方 LLM-Judge 二档协议：语义等价判对、unknown 判错、0/1、temperature=0）、同一 1986 题。
+
+| 口径 | 检索供给 l24（记忆系统） | 全上下文（天花板） | Δ |
+|---|---|---|---|
+| **Token F1** | 0.4551 | **0.4801** | **+2.5pp** |
+| 逐题 F1 胜场 | 593 | **702**（平 691） | +109 |
+| **LLM-Judge accuracy** | **0.6148** | 0.6062 | -0.9pp |
+| unknown 率 | 7.6% | 22.5% | +14.9pp |
+
+分类对照（两口径方向一致，F1 为例）：
+
+| 类别 | n | 全上下文 | 检索供给 l24 | Δ |
+|---|---|---|---|---|
+| multi-hop | 841 | 0.6954 | 0.6116 | **+8.4pp** |
+| temporal | 321 | 0.5397 | 0.1505 | **+38.9pp** |
+| single-hop | 282 | 0.4914 | 0.4110 | +8.0pp |
+| commonsense | 96 | 0.3610 | 0.3376 | +2.3pp |
+| adversarial | 446 | 0.0495 | 0.4323 | **-38.3pp** |
+
+**结论要点**：
+
+1. **天花板真实存在**：F1 口径下全上下文比检索供给高 2.5pp，逐题胜场 702 vs 593；
+   multi-hop / temporal 两个"记忆重灾区"被全量供给拉开 8~39pp——检索供给仍有余量可挖。
+2. **记忆系统最独特的价值是"防误导"**：adversarial（对抗性误导）类，检索供给反超全上下文
+   38~53pp。全上下文把诱饵信息一并吞入，模型 93% 选择拒答（unknown 被判错）；检索供给天然
+   筛掉矛盾/诱饵片段，反而更稳。记忆系统不是简单"压缩上下文"，它同时是**信息过滤器**。
+3. 全量 judge accuracy 检索供给略高（-0.9pp），主要被 adversarial 结构性差异主导；
+   剔除 adversarial 后全上下文全面领先。
+4. 复现：`benchmark/scripts/eval_locomo_125b_fullctx.py`（全量供给评测，KV 复用，断点续跑）+
+   `judge_fullctx.py` + `score_fullctx.py`；逐题结果见 `results/locomo_results_125b_fullctx.jsonl`、
+   `results/judge_125b_l24_v2.jsonl`、`results/judge_125b_fullctx.jsonl`（各 1986 行）。
+
+详细分析见 [`../docs/全上下文天花板对照报告.md`](../docs/全上下文天花板对照报告.md)。

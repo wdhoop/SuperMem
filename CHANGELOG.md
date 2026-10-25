@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## v1.0.2（2026-10-25）
+
+### 新增：全上下文天花板对照（建议④落地）
+
+为给"记忆系统相对理论上限的提升"一个可对外对话的可比锚点，补跑 LoCoMo **全量供给对照**：
+
+- 同一模型（Qwen3.8-Flash-Next IQ3_S）、同一 judge（DeepSeek V4-Flash，官方 LLM-Judge 二档协议）、同一 1986 题；唯一变量是供给方式（检索 limit24 vs 整段对话直进上下文）。
+- 结果（双口径交叉一致）：
+  - Token F1：全上下文 0.4801 > 检索供给 0.4551（+2.5pp），逐题胜 702 vs 593；
+  - accuracy：检索供给 0.6148 > 全上下文 0.6062（-0.9pp）；
+  - 分类结构性差异：multi-hop/temporal/single-hop/commonsense 全上下文领先（+1~46pp），adversarial（对抗性误导）检索供给反超 38~53pp——**记忆系统相对全量供给的核心价值是"信息过滤/防误导"**。
+- 新增脚本：`benchmark/scripts/eval_locomo_125b_fullctx.py`（KV 复用、断点续跑）、`judge_fullctx.py`、`score_fullctx.py`；结果 `benchmark/results/locomo_results_125b_fullctx.jsonl`、`judge_125b_l24_v2.jsonl`、`judge_125b_fullctx.jsonl`（各 1986 行，逐题可复核）。
+- 报告：`docs/全上下文天花板对照报告.md`。
+- 研发指向：temporal（+38.9pp 差距最大）与 multi-hop（+8.4pp）检索覆盖是下一步重点；adversarial 防御作为差异化方向显式化。
+
 ## v1.0.1（2026-10-19）
 
 ### 新增：联想检索（associative retrieval）
