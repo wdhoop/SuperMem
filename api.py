@@ -146,6 +146,37 @@ class _Handler(BaseHTTPRequestHandler):
                 hl = (qs.get("half_life") or [None])[0]
                 hl = float(hl) if hl else None
                 return self._send(200, {"forgotten": search_fusion.forgotten_nodes(ms, threshold, hl)})
+            if path == "/edges":
+                # [2026-10-29 新增] 边列表（只读）：贾维斯等智能体做记忆体检需看边关系
+                limit = min(int((qs.get("limit") or [500])[0]), 5000)
+                offset = int((qs.get("offset") or [0])[0])
+                etype = (qs.get("type") or [None])[0]
+                sql = "SELECT * FROM edges WHERE 1=1"
+                args = []
+                if etype:
+                    sql += " AND edge_type=?"
+                    args.append(etype)
+                sql += " ORDER BY strength DESC LIMIT ? OFFSET ?"
+                args += [limit, offset]
+                rows = ms.graph.conn.execute(sql, args).fetchall()
+                return self._send(200, {"edges": [dict(r) for r in rows], "count": len(rows),
+                                        "limit": limit, "offset": offset})
+            if path == "/stats":
+                # [2026-10-29 新增] 库统计（只读）：节点/边/类型/项目分布
+                s = ms.graph.stats()
+                vc = ms.vector.count()
+                by_type = {}
+                for r in ms.graph.conn.execute(
+                        "SELECT node_type, COUNT(*) AS c FROM nodes GROUP BY node_type"):
+                    by_type[r["node_type"]] = r["c"]
+                by_project = {}
+                for r in ms.graph.conn.execute(
+                        "SELECT project, COUNT(*) AS c FROM nodes GROUP BY project"):
+                    by_project[r["project"]] = r["c"]
+                return self._send(200, {"nodes": s["nodes"], "edges": s["edges"],
+                                        "episodes": s["episodes"], "by_status": s["by_status"],
+                                        "by_type": by_type, "by_project": by_project,
+                                        "vector_indexed": vc, "vector_gap": max(0, s["nodes"] - vc)})
             if path == "/metrics":
                 return self._send(200, metrics_mod.full_report(ms))
             if path == "/sessions":
