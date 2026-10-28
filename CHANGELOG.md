@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## v1.1.0（2026-10-29）
+
+### 剪枝优化：认知更新自动退休 + 访问热度衰减
+
+按"平行替换 / 最小改动 / 剪枝"的优化哲学落地两条剪枝类优化，**不做加法、不加底座**：
+
+- **矛盾自动退休 `auto_supersede_link`**：新节点内容命中认知更新词（放弃/不再/改为/换成/撤销/更新为/升级为/演进为等）且与库内旧 decision/rule/technique/project 节点语义相似（阈值 0.50）时，自动把旧节点流转为 outdated，并挂 `replaced_by` + `superseded_by` 边指向新节点。幂等；permanent 记忆不动。
+- **访问热度衰减**：`compute_weight` 的 causal_factor 由裸 `access_count` 改为热度 `heat = access_count × e^(-ACCESS_HEAT_LAMBDA × 距上次访问天数)`（`ACCESS_HEAT_LAMBDA=0.02`，半衰期约 35 天）。最近仍在访问的记忆保留加成；很久以前频繁用、现在不再用的记忆，热度加成随遗忘曲线消退。无访问记录时行为与旧版完全一致。
+
+改动：`config.py`（新增 `ACCESS_HEAT_LAMBDA` 与 `SUPERSEDE_*` 配置块）、`linker.py`（新增 `auto_supersede_link`）、`extract.py`（两条写入路径挂剪枝 hook）、`core.py`（新增 `_access_age_days`、`compute_weight` 改用 heat）。隔离测试 13/13 通过（`locomo_plus_eval/scripts/test_prune_features.py`）；**基准评测评分严格不变**（注入只写 event 节点、检索排序不调用 compute_weight、评分不碰 weight/status）。
+
+### 随包补齐：四维自动联想（时间/场景/价值/状态）
+
+- 时间维：时序连接词 → before/after 边 + recency 时间加权。
+- 场景维：场景实体 → involves 边 + scene 定向检索。
+- 价值维：目标/愿望短语 → goal 节点 + contributes_to/blocks 边 + importance 分级 + goal 重排。
+- 状态维：状态转移词 → state 节点 + transitions_to 边 + state 定向检索。
+- 该能力为生产已验证并评测过的成果（2026-10-20 上线），本次随包发布补全仓库代码一致性。
+
+### 清理
+
+- 移除与新版 core 不兼容的遗留 MVP 入口 `server.py`（发布入口以 `main.py` / `mcp_server.py` / `bridge/smem.py` 为准）。
+
 ## v1.0.2（2026-10-25）
 
 ### 新增：全上下文天花板对照（建议④落地）

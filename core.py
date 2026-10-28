@@ -25,7 +25,8 @@ class Node:
     def __init__(self, id=None, content="", node_type="event", status="active",
                  timestamp=None, weight=config.W0, project="default", tags=None,
                  source="", confidence=1.0, created_at=None, last_accessed=None,
-                 access_count=0, version_of=None, replaced_by=None, marked_until=None):
+                 access_count=0, version_of=None, replaced_by=None, marked_until=None,
+                 importance=None):
         self.id = id or f"{node_type}_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
         self.content = content
         self.node_type = node_type
@@ -42,12 +43,14 @@ class Node:
         self.version_of = version_of
         self.replaced_by = replaced_by
         self.marked_until = marked_until
+        # [UPD 2026-10-20 价值维] importance 价值分级：goal_related / operational / reference
+        self.importance = importance or ("reference" if node_type != "goal" else "goal_related")
 
     def to_dict(self):
         return {k: getattr(self, k) for k in
                 ("id", "content", "node_type", "status", "timestamp", "weight", "project",
                  "tags", "source", "confidence", "created_at", "last_accessed",
-                 "access_count", "version_of", "replaced_by", "marked_until")}
+                 "access_count", "version_of", "replaced_by", "marked_until", "importance")}
 
     @classmethod
     def from_dict(cls, d):
@@ -112,12 +115,28 @@ def _age_days(node, now_ts=None):
     return max(0.0, (now - created).total_seconds() / 86400.0)
 
 
+def _access_age_days(node, now_ts=None):
+    """距上次访问天数；无访问记录时返回 0（此时 access_count=0，热度项本就为 0，结果一致）。"""
+    if not node.last_accessed:
+        return 0.0
+    now = datetime.strptime(now_ts, "%Y-%m-%d %H:%M:%S") if now_ts else datetime.now()
+    try:
+        la = datetime.strptime(node.last_accessed, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return 0.0
+    return max(0.0, (now - la).total_seconds() / 86400.0)
+
+
 def compute_weight(node, edge_count=0, now_ts=None):
-    """遗忘曲线：W(t) = min(1, max(floor, W0 * e^(-λt) * causal_factor * status_mod))"""
+    """遗忘曲线：W(t) = min(1, max(floor, W0 * e^(-λt) * causal_factor * status_mod))
+    [UPD 2026-10-28 剪枝优化] causal_factor 中访问热度随时间衰减：
+      heat = access_count * e^(-ACCESS_HEAT_LAMBDA * 距上次访问天数)
+    最近仍在访问的记忆保留加成，很久不用只靠历史的记忆加成消退（半衰期 ~35 天）。"""
     level = _level_of(node)
     lam = config.LAMBDA_BY_TYPE[level]
     floor = config.FLOOR_BY_TYPE[level]
-    causal_factor = min(1 + config.CAUSAL_FACTOR_RATE * edge_count * max(node.access_count, 0),
+    heat = max(node.access_count, 0) * math.exp(-config.ACCESS_HEAT_LAMBDA * _access_age_days(node, now_ts))
+    causal_factor = min(1 + config.CAUSAL_FACTOR_RATE * edge_count * heat,
                         config.CAUSAL_FACTOR_MAX)
     status_mod = config.STATUS_MOD.get(node.status, 1.0)
     w = config.W0 * math.exp(-lam * _age_days(node, now_ts)) * causal_factor * status_mod
@@ -186,7 +205,8 @@ class GraphStore:
                 access_count INTEGER NOT NULL DEFAULT 0,
                 version_of TEXT,
                 replaced_by TEXT,
-                marked_until TEXT
+                marked_until TEXT,
+                importance TEXT NOT NULL DEFAULT 'reference'
             );
             CREATE TABLE IF NOT EXISTS edges(
                 id TEXT PRIMARY KEY,
@@ -233,6 +253,14 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_verbatim_node ON verbatim(node_id);
             CREATE INDEX IF NOT EXISTS idx_verbatim_ts ON verbatim(ts);
             """)
+            # [UPD 2026-10-20 价值维] 老库兼容：nodes 表缺 importance 列时补列（幂等）
+            try:
+                cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(nodes)").fetchall()]
+                if "importance" not in cols:
+                    self.conn.execute("ALTER TABLE nodes ADD COLUMN importance TEXT NOT NULL DEFAULT 'reference'")
+                    self.conn.commit()
+            except Exception:
+                pass
             # 初始化运维指标
             meta = self.conn.execute("SELECT k FROM metadata WHERE k='node_count_snapshot'").fetchone()
             if not meta:
@@ -261,12 +289,13 @@ class GraphStore:
                     return dup["id"], False
             self.conn.execute("""INSERT OR IGNORE INTO nodes
                 (id,content,node_type,status,timestamp,weight,project,tags,source,confidence,
-                 created_at,last_accessed,access_count,version_of,replaced_by,marked_until)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 created_at,last_accessed,access_count,version_of,replaced_by,marked_until,importance)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (node.id, node.content, node.node_type, node.status, node.timestamp, node.weight,
                  node.project, json.dumps(node.tags, ensure_ascii=False), node.source, node.confidence,
                  node.created_at, node.last_accessed, node.access_count,
-                 node.version_of, node.replaced_by, node.marked_until))
+                 node.version_of, node.replaced_by, node.marked_until,
+                 getattr(node, "importance", None) or "reference"))
             if self.conn.total_changes or True:
                 self.conn.commit()
             return node.id, True
@@ -326,7 +355,8 @@ class GraphStore:
                     source=row["source"], confidence=row["confidence"], created_at=row["created_at"],
                     last_accessed=row["last_accessed"], access_count=row["access_count"],
                     version_of=row["version_of"], replaced_by=row["replaced_by"],
-                    marked_until=row["marked_until"])
+                    marked_until=row["marked_until"],
+                    importance=row["importance"] if "importance" in row.keys() else None)
         return node
 
     def list_nodes(self, project=None, limit=100, status=None):

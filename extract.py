@@ -36,8 +36,19 @@ def extract_from_text(text, source="manual", project="default", ms=None, dedup=T
                                            source=source, description=e.get("desc", "")))
             # 自动语义关联老节点（消灭孤岛）：新记忆挂到已有知识树上
             try:
-                from linker import auto_link
+                from linker import (auto_link, auto_scene_link, auto_temporal_link, auto_state_link,
+                                    auto_goal_link, auto_supersede_link)
                 auto_link(ms, nid, cand["content"], project=project)
+                # [UPD 2026-10-20 时间维] 时序连接词 → before/after 边（保守规则）
+                auto_temporal_link(ms, nid, cand["content"], project=project)
+                # [UPD 2026-10-20 空间维] 场景实体 → involves 边
+                auto_scene_link(ms, nid, cand["content"], project=project)
+                # [UPD 2026-10-20 状态维] 状态转移词 → transitions_to 边
+                auto_state_link(ms, nid, cand["content"], project=project)
+                # [UPD 2026-10-20 价值/目标维] 目标/愿望/里程碑短语 → goal 节点 + contributes_to 边
+                auto_goal_link(ms, nid, cand["content"], project=project)
+                # [UPD 2026-10-28 剪枝优化] 认知更新词 + 语义命中 → 旧 decision/rule 自动退休
+                auto_supersede_link(ms, nid, cand["content"], project=project)
             except Exception:
                 pass
     # LLM 增强（可选配置；默认关闭）
@@ -72,7 +83,19 @@ def _llm_enhance(text, project, source, ms):
             node = Node(content=item["content"][:500], node_type=item.get("node_type", "insight"),
                         project=project, source=f"llm:{source}",
                         tags=item.get("tags", []), confidence=0.9)
-            ms.add_node_with_vector(node)
+            nid, created = ms.add_node_with_vector(node)
+            if created:
+                try:
+                    from linker import (auto_link, auto_scene_link, auto_temporal_link, auto_state_link,
+                                        auto_goal_link, auto_supersede_link)
+                    auto_link(ms, nid, node.content, project=project)
+                    auto_temporal_link(ms, nid, node.content, project=project)   # [时间维]
+                    auto_scene_link(ms, nid, node.content, project=project)      # [空间维]
+                    auto_state_link(ms, nid, node.content, project=project)      # [状态维]
+                    auto_goal_link(ms, nid, node.content, project=project)       # [价值/目标维]
+                    auto_supersede_link(ms, nid, node.content, project=project)  # [剪枝优化] 认知更新自动退休
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[extract] LLM enhance failed: {e}")
 

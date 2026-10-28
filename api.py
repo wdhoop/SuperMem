@@ -19,6 +19,7 @@ from core import Edge, MemorySystem, Node
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
 import extract  # noqa: E402
+import event_normalizer  # noqa: E402  [2026-10-20 时间维] 边类型归一
 import metrics as metrics_mod  # noqa: E402
 import search_fusion  # noqa: E402
 import time_window  # noqa: E402
@@ -86,8 +87,14 @@ class _Handler(BaseHTTPRequestHandler):
                 q = (qs.get("q") or [""])[0]
                 limit = int((qs.get("limit") or [config.SEARCH_LIMIT_DEFAULT])[0])
                 project = (qs.get("project") or [None])[0]
+                recency = int((qs.get("recency") or [config.RECENCY_DEFAULT])[0])  # [时间维]
+                scene = (qs.get("scene") or [None])[0]                             # [空间维]
+                goal = int((qs.get("goal") or [0])[0])                             # [价值维]
+                state = (qs.get("state") or [None])[0]                             # [状态维]
                 if q:
-                    res = search_fusion.nodes_query(ms, q, limit=limit, project=project)
+                    res = search_fusion.nodes_query(ms, q, limit=limit, project=project,
+                                                    recency=recency, scene=scene, goal=goal,
+                                                    state=state)
                 else:
                     res = [n.to_dict() for n in ms.graph.list_nodes(project=project, limit=limit)]
                 return self._send(200, {"results": res})
@@ -96,13 +103,25 @@ class _Handler(BaseHTTPRequestHandler):
                 limit = int((qs.get("limit") or [config.SEARCH_LIMIT_DEFAULT])[0])
                 project = (qs.get("project") or [None])[0]
                 force_raw = (qs.get("force") or ["0"])[0] in ("1", "true", "yes")
+                recency = int((qs.get("recency") or [config.RECENCY_DEFAULT])[0])  # [时间维]
+                scene = (qs.get("scene") or [None])[0]                             # [空间维]
+                goal = int((qs.get("goal") or [0])[0])                             # [价值维]
+                state = (qs.get("state") or [None])[0]                             # [状态维]
                 return self._send(200, search_fusion.search_strong(ms, q, limit=limit,
-                                                                   project=project, force_raw=force_raw))
+                                                                   project=project, force_raw=force_raw,
+                                                                   recency=recency, scene=scene,
+                                                                   goal=goal, state=state))
             if path.startswith("/search/"):
                 q = urllib.parse.unquote(path[len("/search/"):])
                 limit = int((qs.get("limit") or [config.SEARCH_LIMIT_DEFAULT])[0])
                 project = (qs.get("project") or [None])[0]
-                return self._send(200, search_fusion.search(ms, q, limit=limit, project=project))
+                recency = int((qs.get("recency") or [config.RECENCY_DEFAULT])[0])  # [时间维]
+                scene = (qs.get("scene") or [None])[0]                             # [空间维]
+                goal = int((qs.get("goal") or [0])[0])                             # [价值维]
+                state = (qs.get("state") or [None])[0]                             # [状态维]
+                return self._send(200, search_fusion.search(ms, q, limit=limit, project=project,
+                                                            recency=recency, scene=scene,
+                                                            goal=goal, state=state))
             if path.startswith("/rewind/"):
                 parts = path[len("/rewind/"):].split("/", 1)
                 ts = urllib.parse.unquote(parts[0])
@@ -112,7 +131,10 @@ class _Handler(BaseHTTPRequestHandler):
                 parts = path[len("/timeline/"):].split("/")
                 start = urllib.parse.unquote(parts[0])
                 end = urllib.parse.unquote(parts[1]) if len(parts) > 1 else start
-                return self._send(200, time_window.timeline(ms, start, end))
+                project = (qs.get("project") or [None])[0]      # [时间维]
+                q = (qs.get("q") or [None])[0]                  # [时间维]
+                return self._send(200, time_window.timeline(ms, start, end,
+                                                            project=project, q=q))
             if path == "/episodes":
                 return self._send(200, {"episodes": time_window.get_episodes(ms)})
             if path.startswith("/episodes/"):
@@ -154,14 +176,19 @@ class _Handler(BaseHTTPRequestHandler):
                 node = Node(content=body.get("content", ""), node_type=body.get("node_type", "event"),
                             project=body.get("project", "default"), tags=body.get("tags", []),
                             source=body.get("source", "api"), confidence=body.get("confidence", 1.0),
-                            timestamp=body.get("timestamp"))
+                            timestamp=body.get("timestamp"),
+                            importance=body.get("importance"))  # [价值维] goal_related/operational/reference
                 if not node.content:
                     return self._send(400, {"error": "content required"})
                 nid, created = ms.add_node_with_vector(node)
                 if created:
                     try:
-                        from linker import auto_link
+                        from linker import auto_link, auto_scene_link, auto_temporal_link, auto_state_link, auto_goal_link
                         auto_link(ms, nid, node.content, project=node.project)
+                        auto_temporal_link(ms, nid, node.content, project=node.project)  # [时间维]
+                        auto_scene_link(ms, nid, node.content, project=node.project)     # [空间维]
+                        auto_state_link(ms, nid, node.content, project=node.project)     # [状态维]
+                        auto_goal_link(ms, nid, node.content, project=node.project)      # [价值/目标维]
                     except Exception:
                         pass
                 # [2026-10-17] 日常写入自动落原文层：content 哈希幂等 vid，node_id 双向指针
@@ -196,14 +223,20 @@ class _Handler(BaseHTTPRequestHandler):
                         nid, created = ms.add_node_with_vector(node)
                         if created:
                             try:
-                                from linker import auto_link
+                                from linker import auto_link, auto_scene_link, auto_temporal_link, auto_state_link, auto_goal_link
                                 auto_link(ms, nid, node.content, project=node.project)
+                                auto_temporal_link(ms, nid, node.content, project=node.project)  # [时间维]
+                                auto_scene_link(ms, nid, node.content, project=node.project)     # [空间维]
+                                auto_state_link(ms, nid, node.content, project=node.project)     # [状态维]
+                                auto_goal_link(ms, nid, node.content, project=node.project)      # [价值/目标维]
                             except Exception:
                                 pass
                         created_n += 1 if created else 0
                 for e in body.get("edges", []):
+                    # [2026-10-20 时间维] 边类型经 event_normalizer 归一（中文别名→标准边类型）
+                    etype = event_normalizer.normalize_edge_type(e.get("type", "related"))
                     ms.graph.add_edge(Edge(from_id=e.get("from", ""), to_id=e.get("to", ""),
-                                           edge_type=e.get("type", "related"),
+                                           edge_type=etype,
                                            source=e.get("source", "api"),
                                            description=e.get("desc", "")))
                 return self._send(200, {"created": created_n, "raw_vids": raw_vids})
@@ -260,8 +293,10 @@ class _Handler(BaseHTTPRequestHandler):
                     to_id = (e.get("to") or e.get("to_id") or "").strip()
                     if not from_id or not to_id:
                         continue
+                    # [2026-10-20 时间维] 边类型归一（中文别名→标准边类型）
+                    etype = event_normalizer.normalize_edge_type(e.get("type") or e.get("edge_type", "related"))
                     edge = Edge(id=e.get("id"), from_id=from_id, to_id=to_id,
-                                edge_type=e.get("type") or e.get("edge_type", "related"),
+                                edge_type=etype,
                                 confidence=e.get("confidence", 1.0),
                                 source=e.get("source", "sync"),
                                 description=e.get("desc") or e.get("description", ""),

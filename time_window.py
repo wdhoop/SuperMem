@@ -55,6 +55,21 @@ def build_episodes(ms, window_hours=6, max_gap_minutes=240):
         for n in w:
             types[n.node_type] = types.get(n.node_type, 0) + 1
         main_type = max(types, key=types.get)
+        # [UPD 2026-10-20 空间维] scenario 优先取窗口内高频场景实体名（involves 边指向），
+        #   无则回退节点类型众数
+        scene_counter = {}
+        for n in w:
+            for e in ms.graph.out_edges(n.id):
+                if e.edge_type not in ("involves", "occurred_in"):
+                    continue
+                ent = ms.graph.get_node(e.to_id)
+                if ent is not None:
+                    name = (ent.content or "").strip()
+                    if len(name) >= 2:
+                        scene_counter[name] = scene_counter.get(name, 0) + 1
+        scenario = main_type
+        if scene_counter:
+            scenario = max(scene_counter, key=scene_counter.get)
         title = (w[0].content[:30] + ("…" if len(w[0].content) > 30 else ""))
         summary = "；".join(n.content[:40] for n in w[:5])
         node_ids = [n.id for n in w]
@@ -89,15 +104,32 @@ def get_episodes(ms, limit=50, scenario=None):
     return out
 
 
-def timeline(ms, start_ts, end_ts):
-    """时间线：范围内 episodes + 事件块 + 节点"""
+def timeline(ms, start_ts, end_ts, project=None, q=None):
+    """时间线：范围内 episodes + 事件块 + 节点。
+    [UPD 2026-10-20 时间维] 支持按项目过滤（project=）与主题字面过滤（q=，
+    匹配 content 子串，不引入向量开销）。"""
     start, end = _parse_dt(start_ts), _parse_dt(end_ts)
     nodes = [n for n in ms.graph.list_nodes(limit=100000)
              if start <= _parse_dt(n.timestamp) <= end and n.status not in ("obsolete", "merged")]
+    if project:
+        nodes = [n for n in nodes if n.project == project]
+    if q:
+        ql = q.strip().lower()
+        nodes = [n for n in nodes if ql in (n.content or "").lower() or
+                 ql in " ".join(n.tags or []).lower()]
     nodes.sort(key=lambda n: n.timestamp)
     eps = [e for e in get_episodes(ms, limit=500)
            if start <= _parse_dt(e["start_timestamp"]) <= end]
-    return {"start": start_ts, "end": end_ts,
+    if project:
+        # episode 按所属节点项目粗过滤：node_ids 含该项目的节点才算
+        def _ep_in_project(e):
+            for i in e.get("node_ids", []):
+                n = ms.graph.get_node(i)
+                if n is not None and n.project == project:
+                    return True
+            return False
+        eps = [e for e in eps if _ep_in_project(e)]
+    return {"start": start_ts, "end": end_ts, "project": project, "q": q,
             "episodes": eps,
             "nodes": [n.to_dict() for n in nodes]}
 

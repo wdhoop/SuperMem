@@ -33,7 +33,9 @@ def normalize_node_type(t):
              "issue": "issue", "问题": "issue", "plot": "plot", "情节": "plot",
              "item": "item", "物件": "item", "scene": "scene", "场景": "scene",
              "work": "work", "作品": "work", "question": "question", "疑问": "question",
-             "system": "system", "系统": "system", "book": "book", "书目": "book"}
+             "system": "system", "系统": "system", "book": "book", "书目": "book",
+             "goal": "goal", "目标": "goal", "愿望": "goal",
+             "state": "state", "状态": "state", "态势": "state"}
     if t in exact:
         return exact[t]
     if t in config.NODE_TYPES:
@@ -51,7 +53,22 @@ def normalize_edge_type(t):
              "同主题": "shares_theme_with", "相关": "related", "合并": "merged_into",
              "取代": "replaced_by", "使用规则": "uses_rule", "包含技法": "contains_technique",
              "反驳": "refutes", "使能": "enable", "导致": "enable", "enable": "enable",
-             "derived_from": "derives_insight", "relates_to": "related"}
+             "derived_from": "derives_insight", "relates_to": "related",
+             # [UPD 2026-10-20 时间维] 时序连接词归一
+             "之前": "before", "此前": "before", "起初": "before", "最初": "before",
+             "之后": "after", "后来": "after", "随后": "after", "此后": "after",
+             "最终": "after", "更新为": "superseded_by", "升级为": "superseded_by",
+             "演进为": "superseded_by", "新方案取代": "superseded_by",
+             # [UPD 2026-10-20 空间维] 情境边归一
+             "涉及": "involves", "提到": "involves", "用到": "involves", "发生于": "occurred_in",
+             "发生在": "occurred_in", "发生场景": "occurred_in",
+             # [UPD 2026-10-20 价值维] 价值边归一
+             "有助于": "contributes_to", "促进": "contributes_to", "服务于": "contributes_to",
+             "支撑": "contributes_to", "阻碍": "blocks", "妨碍": "blocks", "冲突": "blocks",
+             # [UPD 2026-10-20 状态维] 状态边归一
+             "状态变为": "transitions_to", "状态变成": "transitions_to",
+             "状态切换到": "transitions_to", "切换为": "transitions_to",
+             "状态改为": "transitions_to", "状态改成": "transitions_to", "进入": "transitions_to"}
     if t in alias:
         return alias[t]
     return "related"   # 未知类型归入 related（治理中逐步归一）

@@ -161,17 +161,28 @@ def _time_bonus(node):
     return max(0.2, 1.0 - days * 0.01)
 
 
-def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_queries=None):
+def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_queries=None,
+                      recency=0, scene=None, goal=0, state=None):
     """并行三路召回 + RRF 融合 + 时间加成，返回候选（已按融合分排序）。
     assoc_queries: 联想句列表（可选）——每条联想句额外参与 vector/fts 召回并合并 RRF，
-    扩大跨时间/跨粒度的召回面（评测回写，默认 None 时行为与旧版完全一致）。"""
+    扩大跨时间/跨粒度的召回面（评测回写，默认 None 时行为与旧版完全一致）。
+    recency: [UPD 2026-10-20 时间维] 0=默认（时间仅小幅加成）；1=时间加权模式——
+    时间加成占比从 40% 提到 60%，且窗口内（RECENCY_WINDOW_DAYS 天）记忆额外加 15% 分，
+    适合"最近/近况/最近做了什么"类查询。
+    scene: [UPD 2026-10-20 空间维] 场景实体名（可选）——沿 involves 边带出该场景下的
+    记忆节点并入 RRF（场景过滤检索），适合"在 XX 场景/项目/设备下发生了什么"类查询。
+    goal: [UPD 2026-10-20 价值维] 目标导向重排（可选）——库内 goal 节点沿
+    contributes_to 边扩散加权（服务目标的记忆前置）、沿 blocks 边降权（阻碍目标的
+    记忆后置），适合"对当前目标最有用的是什么"类查询。
+    state: [UPD 2026-10-20 状态维] 状态名（可选）——沿 transitions_to 入边带出
+    "导致该状态"的事件/节点并入 RRF，适合"什么导致了 XX 状态"类查询。"""
     cands = {}
 
     def ensure(nid, node):
         if nid not in cands:
             cands[nid] = {"node": node, "vector_score": 0.0, "fts_score": 0.0,
-                          "causal": 0, "assoc": 0, "rrf": 0.0, "time_bonus": 1.0,
-                          "recall_score": 0.0}
+                          "causal": 0, "assoc": 0, "scene": 0, "goal": 0, "goal_block": 0,
+                          "state": 0, "rrf": 0.0, "time_bonus": 1.0, "recall_score": 0.0}
         return cands[nid]
 
     # ① vector 向量路
@@ -241,11 +252,94 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
             rec["causal"] += 1
             rec["rrf"] += 1.0 / (60.0 + causal_rank)
 
+    # ⑤ scene 场景路（[UPD 2026-10-20 空间维]，可选）：scene=实体名 →
+    #    沿 involves 入边带出"该场景下"的记忆节点并入 RRF（带 scene 标记）
+    scene_rank = 0
+    if scene:
+        scene_name = str(scene).strip()
+        ent_nodes = [n for n in ms.graph.list_nodes(limit=100000)
+                     if n.node_type in config.SCENE_ENTITY_TYPES
+                     and n.status != "obsolete"
+                     and (scene_name == (n.content or "").strip()
+                          or (len(scene_name) >= 2 and scene_name in (n.content or "")))]
+        for ent in ent_nodes[:5]:
+            for e in ms.graph.in_edges(ent.id):
+                if e.edge_type not in ("involves", "occurred_in"):
+                    continue
+                nn = ms.graph.get_node(e.from_id)
+                if not nn or nn.status == "obsolete":
+                    continue
+                scene_rank += 1
+                rec = ensure(nn.id, nn)
+                rec["scene"] = rec.get("scene", 0) + 1
+                rec["rrf"] += config.SCENE_SEARCH_WEIGHT * (1.0 / (60.0 + scene_rank))
+
+    # ⑥ goal 目标路（[UPD 2026-10-20 价值维]，可选）：goal=1 → 库内 goal 节点沿
+    #    contributes_to 入边加权（服务目标前置）、沿 blocks 入边降权（阻碍目标后置）
+    goal_rank = 0
+    block_rank = 0
+    if goal and config.GOAL_SEARCH_ENABLED:
+        goal_nodes = [n for n in ms.graph.list_nodes(limit=100000)
+                      if n.node_type == "goal" and n.status != "obsolete"]
+        for g in goal_nodes[:10]:
+            for e in ms.graph.in_edges(g.id):
+                nn = ms.graph.get_node(e.from_id)
+                if not nn or nn.status == "obsolete":
+                    continue
+                if e.edge_type == "contributes_to":
+                    goal_rank += 1
+                    rec = ensure(nn.id, nn)
+                    rec["goal"] = rec.get("goal", 0) + 1
+                    rec["rrf"] += config.GOAL_SEARCH_WEIGHT * (1.0 / (60.0 + goal_rank))
+                elif e.edge_type == "blocks":
+                    block_rank += 1
+                    rec = ensure(nn.id, nn)
+                    rec["goal_block"] = rec.get("goal_block", 0) + 1
+                    rec["rrf"] -= config.GOAL_BLOCK_PENALTY * (1.0 / (60.0 + block_rank))
+
+    # ⑦ state 状态路（[UPD 2026-10-20 状态维]，可选）：state=状态名 →
+    #    沿 transitions_to 入边带出"导致该状态"的事件/节点并入 RRF
+    state_rank = 0
+    if state:
+        state_name = str(state).strip()
+        state_nodes = [n for n in ms.graph.list_nodes(limit=100000)
+                       if n.node_type == "state" and n.status != "obsolete"
+                       and (state_name == (n.content or "").strip()
+                            or (len(state_name) >= 2 and state_name in (n.content or "")))]
+        for sn in state_nodes[:5]:
+            for e in ms.graph.in_edges(sn.id):
+                if e.edge_type != "transitions_to":
+                    continue
+                nn = ms.graph.get_node(e.from_id)
+                if not nn or nn.status == "obsolete":
+                    continue
+                state_rank += 1
+                rec = ensure(nn.id, nn)
+                rec["state"] = rec.get("state", 0) + 1
+                rec["rrf"] += config.STATE_SEARCH_WEIGHT * (1.0 / (60.0 + state_rank))
+
     # 时间加成 + 最终融合分（RRF 分 * 新鲜度加权，最多上浮 40%）
+    # [UPD 2026-10-20 时间维] recency=1 时：时间占比加大（0.4+0.6*time_bonus），
+    #   且 RECENCY_WINDOW_DAYS 窗口内记忆再上浮 15%（近况类查询优先召回最新）
+    recency = 1 if recency else 0
+    window_days = max(1, config.RECENCY_WINDOW_DAYS)
     out = []
     for nid, rec in cands.items():
-        rec["time_bonus"] = _time_bonus(rec["node"])
-        rec["recall_score"] = rec["rrf"] * (0.6 + 0.4 * rec["time_bonus"])
+        node = rec["node"]
+        rec["time_bonus"] = _time_bonus(node)
+        base = rec["rrf"]
+        if recency:
+            in_window = 0.0
+            try:
+                ts = datetime.strptime(node.timestamp, "%Y-%m-%d %H:%M")
+                days_ago = max(0.0, (datetime.now() - ts).total_seconds() / 86400.0)
+                if days_ago <= window_days:
+                    in_window = 0.15
+            except (ValueError, TypeError):
+                pass
+            rec["recall_score"] = base * (0.4 + 0.6 * rec["time_bonus"]) + in_window
+        else:
+            rec["recall_score"] = base * (0.6 + 0.4 * rec["time_bonus"])
         out.append(rec)
     out.sort(key=lambda c: c["recall_score"], reverse=True)
     return out[:top_k]
@@ -257,9 +351,13 @@ def rerank(ms, cands, top_n=config.SEARCH_LIMIT_DEFAULT):
     return cands[:top_n]
 
 
-def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=True):
-    """完整检索：三路召回 → RRF 融合 → 时间加成 → 因果链（causes/effects 各取 3 层）。"""
-    cands = recall_candidates(ms, q, project=project)
+def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=True,
+           recency=0, scene=None, goal=0, state=None):
+    """完整检索：三路召回 → RRF 融合 → 时间加成 → 因果链（causes/effects 各取 3 层）。
+    recency=1：时间加权模式；scene=：场景过滤检索；goal=1：目标导向重排；
+    state=：状态检索（见 recall_candidates）。"""
+    cands = recall_candidates(ms, q, project=project, recency=recency, scene=scene,
+                              goal=goal, state=state)
     top = rerank(ms, cands, top_n=limit)
     results = []
     for c in top:
@@ -276,18 +374,22 @@ def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=T
     return {"query": q, "limit": limit, "engine": "recall+rrf(V6,3路)", "results": results}
 
 
-def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_raw=False, expand=False):
+def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_raw=False,
+                  expand=False, recency=0, scene=None, goal=0, state=None):
     """强召回检索（2026-10-17 原文层）：先走三路召回+RRF；
     当图 top1 向量距离过远（语义不够近）、融合分极端低、无结果、或显式 force_raw 时，
     下探原文层（verbatim 向量）逐字召回，返回原文块 + 关联节点，带出处。
     日常检索（search/nodes_query）不触碰原文层。
     expand=True（2026-10-19 评测回写）：额外启用联想检索——生成联想句扩展召回面，
-    未配置 config.ASSOC_* 或生成失败时静默回退，与 expand=False 结果一致。"""
+    未配置 config.ASSOC_* 或生成失败时静默回退，与 expand=False 结果一致。
+    recency=1 / scene= / goal=1 / state=（2026-10-20 时间维/空间维/价值维/状态维）：
+    时间加权 / 场景过滤 / 目标导向重排 / 状态检索。"""
     assoc_queries = []
     if expand and _assoc_enabled():
         assoc_queries = _assoc_call(q)
 
-    cands = recall_candidates(ms, q, project=project, assoc_queries=assoc_queries)
+    cands = recall_candidates(ms, q, project=project, assoc_queries=assoc_queries,
+                              recency=recency, scene=scene, goal=goal, state=state)
     top = rerank(ms, cands, top_n=limit)
     results = []
     for c in top:
@@ -339,9 +441,10 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
             "results": results, "raw": raw, "assoc_queries": assoc_queries}
 
 
-def nodes_query(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None):
+def nodes_query(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, recency=0, scene=None, goal=0, state=None):
     """/nodes?q= 走同一管线（三路召回+RRF），不带因果链（保持轻量）。"""
-    cands = recall_candidates(ms, q, project=project)
+    cands = recall_candidates(ms, q, project=project, recency=recency, scene=scene,
+                              goal=goal, state=state)
     top = rerank(ms, cands, top_n=limit)
     return [{"node": c["node"].to_dict(), "score": round(c["recall_score"], 4)} for c in top]
 
