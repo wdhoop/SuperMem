@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## v1.1.1（2026-10-29）
+
+### 新增：注意力倾斜（attention tilt，借鉴 digital-life-core v0.9.9）
+
+把数字生命内核的注意力阶梯（危机×3 / 日常×0.1）翻译为记忆检索的温和版：
+
+- 检索结果**全量召回后按当前状态向量重排，只改顺序、不删内容**——"记忆一条都没丢，只是此刻该先看到什么"。
+- 两层信号：
+  - **活跃目标自动感知**：库内 `status=active` 的 goal 节点沿 contributes_to / blocks 边扩散加权，等价"此刻系统在忙什么，相关记忆优先"；
+  - **importance 倾斜**：goal_related ×1.15、operational ×1.0、reference ×0.9，乘在融合分上。
+- 默认开启（`TILT_ENABLED=True`，`TILT_GOAL_BOOST` / `TILT_REF_PENALTY` 可调）；无活跃 goal 或全 reference 库时零影响，评测对照一键 `TILT_ENABLED=False`。
+- 检索响应新增 `tilted` / `tilt_boost` 字段，行为可观测。
+
+改动：`config.py`（TILT_* 配置块）、`search_fusion.py`（recall_candidates / search / search_strong / nodes_query 全部支持 `tilt` 参数）、`api.py`（`/nodes`、`/search`、`/search_strong` 透传 `tilt` 参数）。
+
+### 新增：写入回执验证（write receipt，借鉴 digital-life-core v0.9.19）
+
+数字生命内核"7 场梦只存 1 场"的教训——**写完按原文读回，不假装成功**：
+
+- `saved` 是唯一判定依据：写入后按主键直读节点，`content + project` 逐字比对才判已存。
+- 读不回自动**再写一次**，二次不回才如实报未存住。
+- `POST /nodes` 响应新增 `saved` / `verified` 字段；`POST /extract` 新增 `verified_n`（每条新建节点写后读回计数）。
+
+改动：`api.py`（`_verify_saved` 静态方法 + /nodes、/extract 两条写入路径接入）。
+
 ## v1.1.0（2026-10-29）
 
 ### 剪枝优化：认知更新自动退休 + 访问热度衰减

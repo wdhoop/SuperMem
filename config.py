@@ -148,6 +148,21 @@ STATE_SEARCH_WEIGHT = 0.35
 # 自动创建 state 节点的 importance 默认值（状态快照对决策有用 → operational）
 STATE_NODE_IMPORTANCE = "operational"
 
+# ---- 注意力倾斜 attention tilt（2026-10-29 借鉴 digital-life-core v0.9.9）----
+# 借鉴点：检索结果全量召回后按"当前状态向量"重排——只改顺序不删内容
+#   （digital-life-core 的"前额叶切除"教训：危机×3 / 日常×0.1，中间线性插值）。
+# SuperMem 的"当前状态向量"翻译为两层信号：
+#   A. 活跃目标自动感知：库内存在 status=active 的 goal 节点时，自动沿
+#      contributes_to/blocks 边加权（复用价值维 goal 路逻辑，无需调用方显式传 goal=1）——
+#      语义等价"此刻该关注什么"；
+#   B. importance 倾斜：goal_related 记忆 +15%（服务当前目标）、reference 记忆 -10%
+#      （背景资料后置）、operational 不变——温和版的危机/日常阶梯。
+# 默认开启：行为变化仅出现在"库内确有活跃 goal 或节点带 importance 字段"时，
+#   无 goal 库/全 reference 库零影响；如需对照旧基线（LoCoMo 等评测），一键置 False。
+TILT_ENABLED = True                              # 总开关
+TILT_AUTO_GOAL = True                            # 活跃目标自动感知（未显式传 goal 时生效）
+TILT_IMPORTANCE_BOOST = {"goal_related": 1.15, "operational": 1.0, "reference": 0.9}
+
 # ---- 状态机（说明书 §五）----
 STATUSES = ["active", "confirmed", "permanent", "hypothesis",
             "outdated", "obsolete", "disputed", "merged"]

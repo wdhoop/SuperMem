@@ -162,7 +162,7 @@ def _time_bonus(node):
 
 
 def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_queries=None,
-                      recency=0, scene=None, goal=0, state=None):
+                      recency=0, scene=None, goal=0, state=None, tilt=False):
     """并行三路召回 + RRF 融合 + 时间加成，返回候选（已按融合分排序）。
     assoc_queries: 联想句列表（可选）——每条联想句额外参与 vector/fts 召回并合并 RRF，
     扩大跨时间/跨粒度的召回面（评测回写，默认 None 时行为与旧版完全一致）。
@@ -175,7 +175,14 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
     contributes_to 边扩散加权（服务目标的记忆前置）、沿 blocks 边降权（阻碍目标的
     记忆后置），适合"对当前目标最有用的是什么"类查询。
     state: [UPD 2026-10-20 状态维] 状态名（可选）——沿 transitions_to 入边带出
-    "导致该状态"的事件/节点并入 RRF，适合"什么导致了 XX 状态"类查询。"""
+    "导致该状态"的事件/节点并入 RRF，适合"什么导致了 XX 状态"类查询。
+    tilt: [UPD 2026-10-29 注意力倾斜，借鉴 digital-life-core v0.9.9] 可选——
+    True 时启用注意力倾斜（只改排序不删内容）：
+      A. 活跃目标自动感知（config.TILT_AUTO_GOAL）：调用方未显式传 goal 时，自动沿
+         status=active 的 goal 节点的 contributes_to/blocks 边加权；
+      B. importance 倾斜（config.TILT_IMPORTANCE_BOOST）：goal_related +15%、
+         reference -10%、operational 不变（温和版危机/日常阶梯）。
+    默认 False 时行为与旧版完全一致。"""
     cands = {}
 
     def ensure(nid, node):
@@ -276,11 +283,15 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
 
     # ⑥ goal 目标路（[UPD 2026-10-20 价值维]，可选）：goal=1 → 库内 goal 节点沿
     #    contributes_to 入边加权（服务目标前置）、沿 blocks 入边降权（阻碍目标后置）
+    # [UPD 2026-10-29 注意力倾斜] tilt 且未显式传 goal 时自动感知：只取 status=active
+    #    的 goal 节点（"此刻该关注什么"），复用同一套加权逻辑。
     goal_rank = 0
     block_rank = 0
-    if goal and config.GOAL_SEARCH_ENABLED:
+    auto_goal = bool(tilt and config.TILT_ENABLED and config.TILT_AUTO_GOAL and not goal)
+    if (goal or auto_goal) and config.GOAL_SEARCH_ENABLED:
         goal_nodes = [n for n in ms.graph.list_nodes(limit=100000)
-                      if n.node_type == "goal" and n.status != "obsolete"]
+                      if n.node_type == "goal" and n.status != "obsolete"
+                      and (n.status == "active" if auto_goal else True)]
         for g in goal_nodes[:10]:
             for e in ms.graph.in_edges(g.id):
                 nn = ms.graph.get_node(e.from_id)
@@ -321,8 +332,11 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
     # 时间加成 + 最终融合分（RRF 分 * 新鲜度加权，最多上浮 40%）
     # [UPD 2026-10-20 时间维] recency=1 时：时间占比加大（0.4+0.6*time_bonus），
     #   且 RECENCY_WINDOW_DAYS 窗口内记忆再上浮 15%（近况类查询优先召回最新）
+    # [UPD 2026-10-29 注意力倾斜] tilt 时叠加 importance 倾斜（只改排序不删内容）：
+    #   goal_related +15% / reference -10% / operational 不变，乘在融合分上。
     recency = 1 if recency else 0
     window_days = max(1, config.RECENCY_WINDOW_DAYS)
+    tilt_on = bool(tilt and config.TILT_ENABLED)
     out = []
     for nid, rec in cands.items():
         node = rec["node"]
@@ -340,6 +354,11 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
             rec["recall_score"] = base * (0.4 + 0.6 * rec["time_bonus"]) + in_window
         else:
             rec["recall_score"] = base * (0.6 + 0.4 * rec["time_bonus"])
+        if tilt_on:
+            imp = getattr(node, "importance", None) or "reference"
+            boost = config.TILT_IMPORTANCE_BOOST.get(imp, 1.0)
+            rec["tilt_boost"] = boost
+            rec["recall_score"] = rec["recall_score"] * boost
         out.append(rec)
     out.sort(key=lambda c: c["recall_score"], reverse=True)
     return out[:top_k]
@@ -352,12 +371,13 @@ def rerank(ms, cands, top_n=config.SEARCH_LIMIT_DEFAULT):
 
 
 def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=True,
-           recency=0, scene=None, goal=0, state=None):
+           recency=0, scene=None, goal=0, state=None, tilt=False):
     """完整检索：三路召回 → RRF 融合 → 时间加成 → 因果链（causes/effects 各取 3 层）。
     recency=1：时间加权模式；scene=：场景过滤检索；goal=1：目标导向重排；
-    state=：状态检索（见 recall_candidates）。"""
+    state=：状态检索；tilt=True：注意力倾斜（活跃目标自动感知 + importance 倾斜，
+    只改排序不删内容，见 recall_candidates）。"""
     cands = recall_candidates(ms, q, project=project, recency=recency, scene=scene,
-                              goal=goal, state=state)
+                              goal=goal, state=state, tilt=tilt)
     top = rerank(ms, cands, top_n=limit)
     results = []
     for c in top:
@@ -367,15 +387,18 @@ def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=T
                 "weight_zone": ("Core" if node.weight >= config.CORE_MIN else
                                 "Working" if node.weight >= config.WORKING_MIN else
                                 "Cold" if node.weight >= config.COLD_MIN else "Archive")}
+        if "tilt_boost" in c:
+            item["tilt_boost"] = c["tilt_boost"]
         if with_causal:
             item["causes"] = ms.causal.get_causes(node.id)
             item["effects"] = ms.causal.get_effects(node.id)
         results.append(item)
-    return {"query": q, "limit": limit, "engine": "recall+rrf(V6,3路)", "results": results}
+    return {"query": q, "limit": limit, "engine": "recall+rrf(V6,3路)",
+            "tilted": bool(tilt and config.TILT_ENABLED), "results": results}
 
 
 def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_raw=False,
-                  expand=False, recency=0, scene=None, goal=0, state=None):
+                  expand=False, recency=0, scene=None, goal=0, state=None, tilt=False):
     """强召回检索（2026-10-17 原文层）：先走三路召回+RRF；
     当图 top1 向量距离过远（语义不够近）、融合分极端低、无结果、或显式 force_raw 时，
     下探原文层（verbatim 向量）逐字召回，返回原文块 + 关联节点，带出处。
@@ -383,13 +406,14 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
     expand=True（2026-10-19 评测回写）：额外启用联想检索——生成联想句扩展召回面，
     未配置 config.ASSOC_* 或生成失败时静默回退，与 expand=False 结果一致。
     recency=1 / scene= / goal=1 / state=（2026-10-20 时间维/空间维/价值维/状态维）：
-    时间加权 / 场景过滤 / 目标导向重排 / 状态检索。"""
+    时间加权 / 场景过滤 / 目标导向重排 / 状态检索。
+    tilt=True（2026-10-29 注意力倾斜）：活跃目标自动感知 + importance 倾斜，只改排序。"""
     assoc_queries = []
     if expand and _assoc_enabled():
         assoc_queries = _assoc_call(q)
 
     cands = recall_candidates(ms, q, project=project, assoc_queries=assoc_queries,
-                              recency=recency, scene=scene, goal=goal, state=state)
+                              recency=recency, scene=scene, goal=goal, state=state, tilt=tilt)
     top = rerank(ms, cands, top_n=limit)
     results = []
     for c in top:
@@ -399,6 +423,8 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
                 "weight_zone": ("Core" if node.weight >= config.CORE_MIN else
                                 "Working" if node.weight >= config.WORKING_MIN else
                                 "Cold" if node.weight >= config.COLD_MIN else "Archive")}
+        if "tilt_boost" in c:
+            item["tilt_boost"] = c["tilt_boost"]
         item["causes"] = ms.causal.get_causes(node.id)
         item["effects"] = ms.causal.get_effects(node.id)
         results.append(item)
@@ -438,13 +464,15 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
     if assoc_queries:
         mode = mode + "+assoc"
     return {"query": q, "mode": mode, "engine": "recall+rrf→verbatim(强召回,assoc可选)",
-            "results": results, "raw": raw, "assoc_queries": assoc_queries}
+            "results": results, "raw": raw, "assoc_queries": assoc_queries,
+            "tilted": bool(tilt and config.TILT_ENABLED)}
 
 
-def nodes_query(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, recency=0, scene=None, goal=0, state=None):
-    """/nodes?q= 走同一管线（三路召回+RRF），不带因果链（保持轻量）。"""
+def nodes_query(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, recency=0, scene=None, goal=0, state=None, tilt=False):
+    """/nodes?q= 走同一管线（三路召回+RRF），不带因果链（保持轻量）。
+    tilt=True：注意力倾斜（活跃目标自动感知 + importance 倾斜，只改排序）。"""
     cands = recall_candidates(ms, q, project=project, recency=recency, scene=scene,
-                              goal=goal, state=state)
+                              goal=goal, state=state, tilt=tilt)
     top = rerank(ms, cands, top_n=limit)
     return [{"node": c["node"].to_dict(), "score": round(c["recall_score"], 4)} for c in top]
 

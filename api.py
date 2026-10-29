@@ -36,6 +36,20 @@ class _Handler(BaseHTTPRequestHandler):
     def _auth(self):
         return self.headers.get("X-API-Token", "") == config.API_TOKEN
 
+    @staticmethod
+    def _verify_saved(ms, nid, node, attempt=1):
+        """[2026-10-29 借鉴 digital-life-core v0.9.19] 写入回执验证：
+        写完按原文读回（SQLite 主键直读，不走缓存），saved 是唯一判定依据；
+        读不回（missing）就再写一次，二次还不回才如实报未存住（attempt>=2 时
+        返回 False）。dedup 命中（created=False）时节点本来已存在，读回即真。"""
+        got = ms.graph.get_node(nid)
+        if got is not None and got.content == node.content and got.project == node.project:
+            return True, nid
+        if attempt >= 2:
+            return False, nid
+        nid2, _ = ms.add_node_with_vector(node)
+        return _Handler._verify_saved(ms, nid2, node, attempt + 1)
+
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -91,10 +105,11 @@ class _Handler(BaseHTTPRequestHandler):
                 scene = (qs.get("scene") or [None])[0]                             # [空间维]
                 goal = int((qs.get("goal") or [0])[0])                             # [价值维]
                 state = (qs.get("state") or [None])[0]                             # [状态维]
+                tilt = (qs.get("tilt") or [str(int(config.TILT_ENABLED))])[0] in ("1", "true", "yes")  # [注意力倾斜]
                 if q:
                     res = search_fusion.nodes_query(ms, q, limit=limit, project=project,
                                                     recency=recency, scene=scene, goal=goal,
-                                                    state=state)
+                                                    state=state, tilt=tilt)
                 else:
                     res = [n.to_dict() for n in ms.graph.list_nodes(project=project, limit=limit)]
                 return self._send(200, {"results": res})
@@ -107,10 +122,11 @@ class _Handler(BaseHTTPRequestHandler):
                 scene = (qs.get("scene") or [None])[0]                             # [空间维]
                 goal = int((qs.get("goal") or [0])[0])                             # [价值维]
                 state = (qs.get("state") or [None])[0]                             # [状态维]
+                tilt = (qs.get("tilt") or [str(int(config.TILT_ENABLED))])[0] in ("1", "true", "yes")  # [注意力倾斜]
                 return self._send(200, search_fusion.search_strong(ms, q, limit=limit,
                                                                    project=project, force_raw=force_raw,
                                                                    recency=recency, scene=scene,
-                                                                   goal=goal, state=state))
+                                                                   goal=goal, state=state, tilt=tilt))
             if path.startswith("/search/"):
                 q = urllib.parse.unquote(path[len("/search/"):])
                 limit = int((qs.get("limit") or [config.SEARCH_LIMIT_DEFAULT])[0])
@@ -119,9 +135,10 @@ class _Handler(BaseHTTPRequestHandler):
                 scene = (qs.get("scene") or [None])[0]                             # [空间维]
                 goal = int((qs.get("goal") or [0])[0])                             # [价值维]
                 state = (qs.get("state") or [None])[0]                             # [状态维]
+                tilt = (qs.get("tilt") or [str(int(config.TILT_ENABLED))])[0] in ("1", "true", "yes")  # [注意力倾斜]
                 return self._send(200, search_fusion.search(ms, q, limit=limit, project=project,
                                                             recency=recency, scene=scene,
-                                                            goal=goal, state=state))
+                                                            goal=goal, state=state, tilt=tilt))
             if path.startswith("/rewind/"):
                 parts = path[len("/rewind/"):].split("/", 1)
                 ts = urllib.parse.unquote(parts[0])
@@ -212,6 +229,10 @@ class _Handler(BaseHTTPRequestHandler):
                 if not node.content:
                     return self._send(400, {"error": "content required"})
                 nid, created = ms.add_node_with_vector(node)
+                # [2026-10-29 借鉴 digital-life-core v0.9.19] 写入回执验证：
+                # 写完按原文读回（SQLite 主键直读），saved 是唯一判定依据；
+                # 读不回自动重写一次，二次不回才如实报未存住。
+                verified, saved_nid = _Handler._verify_saved(ms, nid, node)
                 if created:
                     try:
                         from linker import auto_link, auto_scene_link, auto_temporal_link, auto_state_link, auto_goal_link
@@ -229,9 +250,12 @@ class _Handler(BaseHTTPRequestHandler):
                                     session=node.project or "default", vid=raw_vid)
                 except Exception:
                     pass
-                return self._send(200, {"id": nid, "created": created, "raw_vid": raw_vid})
+                return self._send(200, {"id": saved_nid, "created": created,
+                                        "saved": verified, "verified": verified,
+                                        "raw_vid": raw_vid})
             if path == "/extract":
                 created_n = 0
+                verified_n = 0
                 raw_vids = []
                 if body.get("text"):
                     created_n += extract.extract_from_text(body["text"], source=body.get("source", "api"),
@@ -253,6 +277,10 @@ class _Handler(BaseHTTPRequestHandler):
                     if node.content:
                         nid, created = ms.add_node_with_vector(node)
                         if created:
+                            # [2026-10-29 写入回执验证] 每条新建节点写后读回，saved 是判定依据
+                            verified, _sn = _Handler._verify_saved(ms, nid, node)
+                            if verified:
+                                verified_n += 1
                             try:
                                 from linker import auto_link, auto_scene_link, auto_temporal_link, auto_state_link, auto_goal_link
                                 auto_link(ms, nid, node.content, project=node.project)
@@ -270,7 +298,8 @@ class _Handler(BaseHTTPRequestHandler):
                                            edge_type=etype,
                                            source=e.get("source", "api"),
                                            description=e.get("desc", "")))
-                return self._send(200, {"created": created_n, "raw_vids": raw_vids})
+                return self._send(200, {"created": created_n, "verified": verified_n,
+                                        "raw_vids": raw_vids})
             if path == "/verbatim":
                 # 原文层写入（2026-10-17）：text 必填，逐字不压缩；
                 # node_id 关联图节点（双向指针），ts/source/session 为出处元数据

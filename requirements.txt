@@ -1,7 +1,5 @@
-# SuperMem 依赖（Python 3.10+）
-# 核心逻辑仅依赖标准库；以下为向量索引 / embedding / 评测所需
+# 超级记忆系统依赖（conda env: supermem, Python 3.11）
 chromadb>=1.5
 transformers>=4.40
 torch>=2.2
 numpy>=1.24
-requests>=2.31        # 仅 benchmark/ 评测脚本需要（QA 循环与 LLM-Judge）
