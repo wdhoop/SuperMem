@@ -21,7 +21,7 @@ SELFCHECK_LOG_DIR = os.path.join(STORAGE_DIR, "selfcheck_logs")
 # ---- 服务（[FIX] 默认只绑定本机 + Token 认证）----
 HOST = "127.0.0.1"
 PORT = 18766  # 原架构 8765 被本机百度输入法占用；18765 被 pythonw 占用，均避开
-API_TOKEN = os.environ.get("SUPERMEM_API_TOKEN", "change-me")
+API_TOKEN = os.environ.get("SUPERMEM_API_TOKEN", "supermem-local-2026")
 
 # ---- 向量索引 ----
 EMBED_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
@@ -76,6 +76,21 @@ SEARCH_LIMIT_DEFAULT = 10
 # ---- 因果链（[FIX] 只沿因果语义边遍历，避免 part_of/evolves_from 稀释因果）----
 CAUSAL_EDGE_TYPES = {"enable", "derives_insight", "refutes", "improves"}
 CAUSAL_DEPTH = 3
+
+# ---- 语义关联链路（2026-11-03 修复：auto_link 双向化 + related 检索扩散）----
+# 背景：auto_link 原 k=2 限量导致同事件多口径记忆（如"解锁广播"与"挖矿实测"）因
+#   top-2 截断/写入时间差漏边；检索侧 causal 路又只沿因果语义边扩散，related 边
+#   "有边不用"——表现为"搜显卡算力解锁带不出挖矿实测"。
+# 修复：① 写入侧 k 2→8 有限放宽 + 双向建边（新→老 与 老→新，复用同一次 query，
+#   成本≈0，根治时间差漏边）；② 阈值分层（强关联全建、弱关联限量，防图稠密稀释）；
+#   ③ 检索侧新增 related 扩散路（默认开），related 邻居并入 RRF。
+AUTO_LINK_K = 8                    # 每节点 related 边上限（原 2，有限放宽防稠密）
+AUTO_LINK_MIN_SCORE = 0.45         # related 边最低语义分（原值不变）
+AUTO_LINK_STRONG_SCORE = 0.70      # 强关联阈值：>=0.70 的候选全建（不额外限量）
+AUTO_LINK_MID_MAX = 3              # 弱关联[0.45,0.70)每节点最多建几条（分层防稀释）
+AUTO_LINK_QUERY_K = 20             # 向量检索候选面（含强+弱候选）
+RELATED_DIFFUSE_ENABLED = True     # 检索侧 related 边扩散开关
+RELATED_DIFFUSE_MAX = 20           # 扩散邻居并入 RRF 的上限（防候选爆炸）
 
 # ---- 原文层 verbatim（2026-10-17 新增）----
 # 逐字原文层：日常检索不触碰，强召回（置信低 / 细节追问 / 溯源）才触发。

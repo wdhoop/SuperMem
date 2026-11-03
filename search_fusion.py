@@ -188,8 +188,9 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
     def ensure(nid, node):
         if nid not in cands:
             cands[nid] = {"node": node, "vector_score": 0.0, "fts_score": 0.0,
-                          "causal": 0, "assoc": 0, "scene": 0, "goal": 0, "goal_block": 0,
-                          "state": 0, "rrf": 0.0, "time_bonus": 1.0, "recall_score": 0.0}
+                          "causal": 0, "related": 0, "assoc": 0, "scene": 0, "goal": 0,
+                          "goal_block": 0, "state": 0, "rrf": 0.0, "time_bonus": 1.0,
+                          "recall_score": 0.0}
         return cands[nid]
 
     # ① vector 向量路
@@ -258,6 +259,42 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
             rec = ensure(nn.id, nn)
             rec["causal"] += 1
             rec["rrf"] += 1.0 / (60.0 + causal_rank)
+
+    # ③b related 语义扩散路（[UPD 2026-11-03] 新增）：从同一批种子沿 related 边
+    #    双向扩散 1 跳并入 RRF——补 causal 路的盲区。related 边由 auto_link 自动建
+    #    （语义关联），此前检索不沿其扩散，导致"搜显卡算力解锁带不出挖矿实测"
+    #    这类同事件多口径记忆分离；开启后命中节点直接带出语义邻居。
+    if config.RELATED_DIFFUSE_ENABLED:
+        related_rank = 0
+        for nid in causal_seeds:
+            for e in ms.graph.out_edges(nid):
+                if e.edge_type != "related":
+                    continue
+                nn = ms.graph.get_node(e.to_id)
+                if not nn or nn.status == "obsolete":
+                    continue
+                related_rank += 1
+                rec = ensure(nn.id, nn)
+                rec["related"] += 1
+                rec["rrf"] += 1.0 / (60.0 + related_rank)
+                if related_rank >= config.RELATED_DIFFUSE_MAX:
+                    break
+            if related_rank >= config.RELATED_DIFFUSE_MAX:
+                break
+            for e in ms.graph.in_edges(nid):
+                if e.edge_type != "related":
+                    continue
+                nn = ms.graph.get_node(e.from_id)
+                if not nn or nn.status == "obsolete":
+                    continue
+                related_rank += 1
+                rec = ensure(nn.id, nn)
+                rec["related"] += 1
+                rec["rrf"] += 1.0 / (60.0 + related_rank)
+                if related_rank >= config.RELATED_DIFFUSE_MAX:
+                    break
+            if related_rank >= config.RELATED_DIFFUSE_MAX:
+                break
 
     # ⑤ scene 场景路（[UPD 2026-10-20 空间维]，可选）：scene=实体名 →
     #    沿 involves 入边带出"该场景下"的记忆节点并入 RRF（带 scene 标记）

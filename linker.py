@@ -16,19 +16,36 @@ score 超阈值建 related 边，让新记忆挂到已有知识树上。
 from core import Edge, Node
 
 
-def auto_link(ms, node_id, content, project="default", k=2, min_score=0.45):
-    """新节点入库后调用：与老节点按语义建 related 边。返回新边数。"""
+def auto_link(ms, node_id, content, project="default", k=None, min_score=None):
+    """新节点入库后调用：与老节点按语义建**双向** related 边，让新记忆挂到已有知识树上。
+    [UPD 2026-11-03] 修复三项（详见 config 语义关联链路块）：
+      ① k 2→8 有限放宽（config.AUTO_LINK_K）——修复相关记忆因 top-2 截断漏边
+        （如"解锁广播"与"挖矿实测"同事件多口径未互相关联）；
+      ② **双向建边**：对命中的老节点同时补"老→新"反向 related 边——根治
+        "先写节点找不到后写节点"的时间差漏边（复用同一次 vector.query，成本≈0）；
+      ③ 阈值分层：score≥AUTO_LINK_STRONG_SCORE 的强关联全建，
+        [AUTO_LINK_MIN_SCORE, STRONG) 弱关联限量 AUTO_LINK_MID_MAX 条，防图稠密稀释。
+    幂等：core.add_edge(dedup=True) 按 from/to/type 去重，重复提取不会产生重复边。
+    失败静默（try/except 由调用方包裹，不阻断主流程）。返回新增 related 边数。"""
+    import config
+    k = int(k if k is not None else config.AUTO_LINK_K)
+    min_score = float(min_score if min_score is not None else config.AUTO_LINK_MIN_SCORE)
+    strong_score = float(config.AUTO_LINK_STRONG_SCORE)
+    mid_max = int(config.AUTO_LINK_MID_MAX)
+    query_k = int(config.AUTO_LINK_QUERY_K)
     try:
-        res = ms.vector.query(content, top_k=k + 8, where={"project": project})
+        res = ms.vector.query(content, top_k=query_k, where={"project": project})
     except Exception:
         return 0
     if not res:
         return 0
-    existing_to = {e.to_id for e in ms.graph.get_edges(node_id)}
+    existing_out = {e.to_id for e in ms.graph.get_edges(node_id)
+                    if e.edge_type == "related"}
     linked = 0
+    mid_linked = 0
     for hit in res:
         oid = hit.get("id", "")
-        if not oid or oid == node_id or oid in existing_to:
+        if not oid or oid == node_id or oid in existing_out:
             continue
         score = hit.get("score", 0.0)
         if score < min_score:
@@ -36,9 +53,18 @@ def auto_link(ms, node_id, content, project="default", k=2, min_score=0.45):
         old = ms.graph.get_node(oid)
         if old is None or old.status == "obsolete":
             continue
+        # 阈值分层：强关联（>=strong）全建；弱关联限量（防弱相关灌满图）
+        if score < strong_score:
+            if mid_linked >= mid_max:
+                continue
+            mid_linked += 1
+        # ① 新 → 老
         ms.graph.add_edge(Edge(from_id=node_id, to_id=oid, edge_type="related",
                                source="auto_link", description="语义关联 %.2f" % score))
-        existing_to.add(oid)
+        # ② 老 → 新（双向：复用同一次 query 结果；dedup 幂等）
+        ms.graph.add_edge(Edge(from_id=oid, to_id=node_id, edge_type="related",
+                               source="auto_link", description="语义关联 %.2f" % score))
+        existing_out.add(oid)
         linked += 1
         if linked >= k:
             break

@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## v1.1.2（2026-11-03）
+
+### 修复：语义关联建边缺陷（related 边"漏建 + 有边不召回"）
+
+生产库实证触发：两条算力口径记忆（解锁基准 `decision_20261031_d923a647` 与挖矿收益核算 `event_20261031_a25b13de`）分存两处、语义检索两轮都带不出对方——"该关联的没关联上，关联上的又不参与召回"。定位为双缺陷：
+
+- **缺陷 A（写入侧）**：`auto_link` 只在入库那一刻跑一次、k=2 限量、永不回溯——先写节点找不到后写节点（时间差漏边），后写节点 top-2 被占满（漏边永不补）。
+- **缺陷 B（召回侧）**：`search_fusion` 只沿因果语义边（enable / derives_insight / refutes / improves）扩散，占边量 97% 的 related 边完全不参与召回（有边不用）。
+
+修复（防爆方案，全量落地）：
+
+- **双向建边**：新→老 的同时补 老→新，复用同一次 vector.query，零额外成本，根治时间差漏边。
+- **k 2→8 有限放宽 + 阈值分层**：score≥0.70 强关联全建；[0.45, 0.70) 弱关联每次最多 3 条，防图稠密稀释。
+- **related 扩散召回**：检索命中种子后沿 related 边双向扩散一跳，top 20 截断并入 RRF（默认开启，`RELATED_DIFFUSE_ENABLED` / `RELATED_DIFFUSE_MAX` 可调）。
+- **历史漏边一次性补建**：新增 `scripts/backfill_related_edges.py`（幂等、限量、支持 `--dry-run` 预演），不做周期全库重扫。
+
+验证（全实证）：图规模 nodes=1907 / edges 9647→25947（backfill 9113 配对，双向 dedup 后净增 16300 条）；检索"显卡算力解锁"第 2 名直接带出挖矿核算节点（修复前两轮检索均带不出）；写入新节点 8 出 + 8 入双向对称、边数增长可控。
+
+改动：`config.py`（语义关联链路配置块）、`linker.py`（auto_link 双向建边 + 分层限量）、`search_fusion.py`（related 扩散路）、`scripts/backfill_related_edges.py`（新增）。
+
 ## v1.1.1（2026-10-29）
 
 ### 新增：注意力倾斜（attention tilt，借鉴 digital-life-core v0.9.9）
