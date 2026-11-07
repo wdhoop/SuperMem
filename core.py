@@ -106,12 +106,39 @@ def _level_of(node):
     return config.TYPE_LEVEL_MAP.get(node.node_type, config.TYPE_LEVEL_DEFAULT)
 
 
-def _age_days(node, now_ts=None):
-    now = datetime.strptime(now_ts, "%Y-%m-%d %H:%M:%S") if now_ts else datetime.now()
+_TS_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+               "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f")
+
+
+def _parse_ts(value):
+    """统一解析历史遗留的多格式时间戳（缺秒 / ISO / 带时区）。
+    [FIX 2026-11-07] 旧实现只认 "%Y-%m-%d %H:%M:%S"，而真实库里大量时间戳是
+    "2026-09-30 17:23"（缺秒）或 "2026-05-05T09:14:00+08:00"（ISO），解析失败后
+    被当成"刚刚创建"（age=0），衰减项恒为 1，这批记忆永不衰减。生产库实测
+    76.5%（1494/1953）节点踩此坑。解析失败一律返回 None，不再伪造 now。"""
+    if not value:
+        return None
+    s = str(value).strip()
     try:
-        created = datetime.strptime(node.created_at, "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        created = now
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except ValueError:
+        pass
+    for fmt in _TS_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _age_days(node, now_ts=None):
+    now = _parse_ts(now_ts) or datetime.now()
+    created = _parse_ts(getattr(node, "created_at", None)) or _parse_ts(getattr(node, "timestamp", None))
+    if created is None:
+        return 0.0
     return max(0.0, (now - created).total_seconds() / 86400.0)
 
 
@@ -119,27 +146,31 @@ def _access_age_days(node, now_ts=None):
     """距上次访问天数；无访问记录时返回 0（此时 access_count=0，热度项本就为 0，结果一致）。"""
     if not node.last_accessed:
         return 0.0
-    now = datetime.strptime(now_ts, "%Y-%m-%d %H:%M:%S") if now_ts else datetime.now()
-    try:
-        la = datetime.strptime(node.last_accessed, "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
+    now = _parse_ts(now_ts) or datetime.now()
+    la = _parse_ts(node.last_accessed)
+    if la is None:
         return 0.0
     return max(0.0, (now - la).total_seconds() / 86400.0)
 
 
 def compute_weight(node, edge_count=0, now_ts=None):
-    """遗忘曲线：W(t) = min(1, max(floor, W0 * e^(-λt) * causal_factor * status_mod))
-    [UPD 2026-10-28 剪枝优化] causal_factor 中访问热度随时间衰减：
-      heat = access_count * e^(-ACCESS_HEAT_LAMBDA * 距上次访问天数)
-    最近仍在访问的记忆保留加成，很久不用只靠历史的记忆加成消退（半衰期 ~35 天）。"""
+    """遗忘曲线：W(t) = min(1, max(floor, W0 * e^(-λ(t)) * causal_factor * status_mod * newness))
+    [FIX 2026-11-07] 两处结构性修正：
+      1) 访问热度不再乘进权重。旧实现 heat=access_count*e^(-λ·天)，访问 51 次就能把
+         causal_factor 顶到上限 2.0 —— 等于"用得越多越权威"，错误记忆靠被反复检索
+         自我强化、永不衰减（生产库实测 1036 个节点顶格 1.00）。访问量只保留在检索
+         排序的 access 分量，用于排序而不用于定性。
+      2) causal 上限由 2.0 降到 1.3，保证 0.7 * 1.3 = 0.91 < 1.0，权重不再全民顶格，
+         新旧条目重新有区分度；新写入的认知另有 7 天新近加成，让新结论先压过旧的。"""
     level = _level_of(node)
     lam = config.LAMBDA_BY_TYPE[level]
     floor = config.FLOOR_BY_TYPE[level]
-    heat = max(node.access_count, 0) * math.exp(-config.ACCESS_HEAT_LAMBDA * _access_age_days(node, now_ts))
-    causal_factor = min(1 + config.CAUSAL_FACTOR_RATE * edge_count * heat,
+    causal_factor = min(1 + config.CAUSAL_FACTOR_RATE * math.log1p(max(edge_count, 0)),
                         config.CAUSAL_FACTOR_MAX)
     status_mod = config.STATUS_MOD.get(node.status, 1.0)
-    w = config.W0 * math.exp(-lam * _age_days(node, now_ts)) * causal_factor * status_mod
+    age = _age_days(node, now_ts)
+    newness = config.NEWNESS_BOOST if age <= config.NEWNESS_BOOST_DAYS else 1.0
+    w = config.W0 * math.exp(-lam * age) * causal_factor * status_mod * newness
     return min(1.0, max(floor, w))
 
 

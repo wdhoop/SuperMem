@@ -38,11 +38,13 @@ DEDUP_THRESHOLD = float(os.environ.get("SUPERMEM_DEDUP_THRESHOLD", "0.85"))
 W0 = 0.7
 ARCHIVE_THRESHOLD = 0.2
 CAUSAL_FACTOR_RATE = 0.3
-CAUSAL_FACTOR_MAX = 2.0
-# [UPD 2026-10-28 剪枝优化] 访问热度随时间衰减（半衰期 ~35 天）：
-#   热度 heat = access_count * exp(-ACCESS_HEAT_LAMBDA * 距上次访问天数)。
-#   修复"访问次数只增不衰"问题：很久以前频繁用、现在不再用的记忆，
-#   其热度加成会随冷落逐渐消退（与遗忘曲线同向，属剪枝类优化，不做加法）。
+CAUSAL_FACTOR_MAX = 1.3   # [FIX 2026-11-07] 原 2.0：0.7*2.0=1.4，任何有边的老条目都会顶格 1.0，新旧无法区分
+NEWNESS_BOOST = 1.2       # 新写入认知的 7 天新近加成，让新结论先压过旧的
+NEWNESS_BOOST_DAYS = 7
+# [UPD 2026-10-28 / FIX 2026-11-07] 访问热度只用于检索排序，不再乘进权重：
+#   原实现 heat = access_count * exp(-ACCESS_HEAT_LAMBDA * 距上次访问天数) 直接乘进
+#   causal_factor，导致"访问越多权重越高"——被反复检索的错误记忆永远顶格、无法退休。
+#   该常量保留供检索侧/历史兼容，compute_weight 已不再引用。
 ACCESS_HEAT_LAMBDA = 0.02
 # 重要性阶梯：S/A/B/C
 LAMBDA_BY_TYPE = {
