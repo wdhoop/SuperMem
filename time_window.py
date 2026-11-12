@@ -8,7 +8,7 @@ timeline（episodes + 事件块 + 节点） / rewind（截至 ts 的因果链回
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import config
 from core import Episode, MemorySystem
@@ -44,9 +44,17 @@ def _parse_dt(s, default=None, end_of_day=False):
         return default
 
 
-def build_episodes(ms, window_hours=6, max_gap_minutes=240, return_stats=False):
+def build_episodes(ms, window_hours=6, max_gap_minutes=240, max_nodes_per_window=None,
+                   return_stats=False):
     """把连续时间窗口内的节点聚合成 Episode（画面式摘要）。
-    窗口划分：按 timestamp 排序，相邻节点间隔 <= max_gap_minutes 归为同窗口。"""
+    窗口划分：按 timestamp 排序，相邻节点间隔 <= max_gap_minutes 归为同窗口；
+    单窗口节点数达到 max_nodes_per_window（默认 config.EPISODE_MAX_NODES）时，
+    在下一个节点处续切——[FIX 2026-11-13b] 原来没有数量上限，连续排布的数据会
+    被塞成一块几百节点的"时间桶"。切分点严格落在节点边界；同一时间戳簇
+    （批量导入常见，实测 326 个节点共用 14:58:00）内部也会切，后续段的
+    start 顺延 1 秒，保证幂等键 start 仍唯一。"""
+    if max_nodes_per_window is None:
+        max_nodes_per_window = getattr(config, "EPISODE_MAX_NODES", 0)
     nodes = ms.graph.list_nodes(limit=100000)
     nodes = [n for n in nodes if n.status not in ("obsolete", "merged")]
     nodes.sort(key=lambda n: n.timestamp)
@@ -57,14 +65,18 @@ def build_episodes(ms, window_hours=6, max_gap_minutes=240, return_stats=False):
         t = _parse_dt(n.timestamp)
         if t is None:
             continue   # [FIX 2026-11-13] 时间无法解析的节点不参与窗口切分（原来塌成 now 会挤到末尾造出假窗口）
-        if prev and (t - prev).total_seconds() / 60 > max_gap_minutes and cur:
-            windows.append(cur)
-            cur = []
+        if prev and cur:
+            gap_over = (t - prev).total_seconds() / 60 > max_gap_minutes
+            size_over = max_nodes_per_window and len(cur) >= max_nodes_per_window
+            if gap_over or size_over:
+                windows.append(cur)
+                cur = []
         cur.append(n)
         prev = t
     if cur:
         windows.append(cur)
 
+    used_starts = set()
     created = 0
     updated = 0
     unchanged = 0
@@ -72,6 +84,17 @@ def build_episodes(ms, window_hours=6, max_gap_minutes=240, return_stats=False):
         if len(w) < 2:
             continue
         start = w[0].timestamp
+        # [FIX 2026-11-13b] start 唯一化：同一时间戳簇被切成多段时，后续段顺延 1 秒。
+        # 幂等键仍是 start；顺延只发生在本次切分内部，不影响真实时间排序。
+        base_dt = _parse_dt(start)
+        if base_dt is not None:
+            cand_dt = base_dt
+            cand = start
+            while cand in used_starts:
+                cand_dt = cand_dt + timedelta(seconds=1)
+                cand = cand_dt.strftime("%Y-%m-%d %H:%M:%S")
+            start = cand
+        used_starts.add(start)
         end = w[-1].timestamp
         types = {}
         for n in w:

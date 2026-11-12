@@ -91,6 +91,10 @@ TOKENIZE_CN_STEP = 2           # 滑窗步长
 TOKENIZE_MAX_TOKENS = 24       # 单次查询最多多少个 token（防 SQL OR 条件爆炸）
 SEARCH_TOKEN_MIN_LEN = 2       # 中文 token 最小长度（单字噪声太大，不进 FTS）
 EPISODE_LIMIT_DEFAULT = 200    # [FIX 2026-11-13 P2-13] /episodes 默认返回条数（原 50 条截断）
+# [FIX 2026-11-13b] episode 单块节点上限。原来只按"相邻间隔 > 4 小时"切窗，没有数量上限：
+#   2026-11-13 04:00 聚合产出一块 361 个节点的"情景块"（实为一整段时间桶，不是一段场景）。
+#   超过上限时在节点边界处按时间续切，保证每块 ≤ 该值。
+EPISODE_MAX_NODES = 40
 
 # ---- 因果链（[FIX] 只沿因果语义边遍历，避免 part_of/evolves_from 稀释因果）----
 CAUSAL_EDGE_TYPES = {"enable", "trigger", "derives_insight", "refutes", "improves"}
