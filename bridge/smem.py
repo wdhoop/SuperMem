@@ -107,11 +107,13 @@ def raw_add(text, ts=None, source="doubao", node_id=None, session=""):
     return api("POST", "/verbatim", body)
 
 
-def raw_search(q, limit=5, force=False):
+def raw_search(q, limit=5, force=False, project=None):
     """强召回：三路召回置信不足时自动下探原文层；--force 强制走原文。"""
     path = f"/search/strong/{urllib.parse.quote(q)}?limit={limit}"
     if force:
         path += "&force=1"
+    if project:
+        path += f"&project={urllib.parse.quote(project)}"
     return api("GET", path)
 
 
@@ -120,7 +122,22 @@ def raw_get(vid):
 
 
 def _fmt_search(res):
-    lines = [f"[检索] {res['query']}（引擎 {res['engine']}）"]
+    """格式化检索结果，并把 verdict 摆在最前面。
+
+    [FIX 2026-11-13 P2-22] 原实现只打"引擎 + 命中列表"，从不看 verdict：
+    查"完全不存在的虚构查询词 zzzqqq"时，库内其实没有任何相关内容（服务端已判
+    no_match），CLI 却照样列出 1 条无关结果，用户看到的就是"它在硬编答案"。
+    现在 no_match 直接明说"库内没有"，hint 标注"只能当线索"。"""
+    head = f"[检索] {res.get('query', '')}（引擎 {res.get('engine', '?')}）"
+    verdict = res.get("verdict")
+    if verdict:
+        head += (f"\n[判定] {verdict} | 置信 {res.get('confidence')}"
+                 f" | {res.get('verdict_reason', '')}")
+    if verdict == "no_match":
+        return head + "\n  （库内没有相关内容，不宜据此作答）"
+    if verdict == "hint":
+        head += "\n  （仅线索级命中：内容存在但还没转正成经验，不要当结论用）"
+    lines = [head]
     for i, it in enumerate(res.get("results", []), 1):
         n = it["node"]
         causes = " ".join(c["content"][:18] for c in it.get("causes", [])[:2])
@@ -128,6 +145,9 @@ def _fmt_search(res):
         lines.append(f"  {i}. [{n['node_type']}/{n['status']}] {n['content']}")
         lines.append(f"     权重 {n['weight']:.2f} ({it.get('weight_zone')}) | 得分 {it['score']}"
                      + (f" | 因: {causes}" if causes else "") + (f" | 果: {effects}" if effects else ""))
+    raw = res.get("raw") or []
+    if raw:
+        lines.append(f"  [原文层] {len(raw)} 块逐字命中（mode={res.get('mode')}）")
     return "\n".join(lines)
 
 
@@ -197,7 +217,9 @@ def main():
         if not h:
             print("ERROR: service unavailable")
             sys.exit(1)
-        print(_fmt_search(search(args.query, limit=args.limit, project=args.project)))
+        # [FIX 2026-11-13 P2-22] 改走 /search/strong：只有这条链路会带 verdict，
+        # /search 不带 → CLI 永远无法判断"库里到底有没有"。
+        print(_fmt_search(raw_search(args.query, limit=args.limit, project=args.project)))
     elif args.cmd == "rewind":
         h = ensure()
         if not h:

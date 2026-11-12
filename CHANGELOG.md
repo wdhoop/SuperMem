@@ -1,5 +1,86 @@
 # CHANGELOG
 
+## v1.2.4（2026-11-13）
+
+### 概述：一次由全量测试驱动的 26 项缺陷大修
+
+首轮全量测试跑出 14 条失败、23 项缺陷；补齐漏检项后共 **26 项**，全部处理（25 项修复 + 1 项复核为非缺陷）。改动 17 个源文件，全部先在生产库的隔离副本上验证，再回写生产代码根。
+
+### 一、检索质量（P0，本轮改善的主体）
+
+1. **锚点加成从"固定 +0.03"改为乘性加成**。原实现对每个锚点命中节点一律加固定分，命中数量多的弱相关节点可以盖过强命中。改为按绑定强度乘性加成（权重 0.35 × strength），并对无锚点支撑的结果设上限约束（`ANCHOR_CEIL_SLACK_RATIO = 0.05`），避免锚点路单独把低分节点顶上去。
+2. **语义扩散不再污染排序**。related 扩散分改为独立记账（`rec["related_rrf"]`），只有主路（图 / 向量 / 关键词）零召回时才用它兜底；主路已有分的结果不再被扩散分抬高。同时加三档约束：strength ≥ 0.55 才扩散、每次最多 8 条、权重 0.7。
+3. **中文长句不再不切词**。原 `_tokenize` 只按空格切，整句中文变成单个 token，关键词路完全失效。改为中文 2–4 字滑窗 gram、英数按词切、过滤口语虚词，并加命中门槛（至少命中一个 ≥2 字 gram，且"命中 ≥2 个 token 或最长 gram ≥4 字"），避免"记忆""系统"这类高频二字词让半个库的节点都拿到 0.6 分。
+4. **关键词候选窗口 320 → 2000**。`_fts_recall` 的 `ORDER BY timestamp DESC LIMIT max(64, top_k*8)` 实际等于"只保留最新的 320 条命中行"，老记忆（往往正是答案）被整批丢弃。这是本轮最大的单点改善来源：窗口提到 2000 后 @1 直接从 53.0% 跳到 74.6%。800 档对照实测掉 2.2 个点且 p95 无改善，故取 2000。
+
+**质量实测**（134 题自召回、同一套集子）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| @1 | 25.6% | **74.6%** |
+| @3 | 64.7% | **94.0%** |
+| @10 | 91.7% | **99.3%** |
+| MRR | 0.478 | **0.846** |
+| 未召回 | 11/134 | **1/134** |
+
+库外问题（12 条库内无答案的提问）：拒答 **12/12**，不编答案。
+
+### 二、数据一致性与接口（P1）
+
+- **边类型被压平成 related**：别名映射表补 trigger / enable / related 族，历史 127 条非标准类型边归一。
+- **grade 重复计算**：写入与状态变更各算一次，且两次入参不同。合并为单次，以节点最终状态为准。
+- **`/health` `/stats` 的 gap 口径错**：把 merged / obsolete 节点也算进"向量缺口"，导致 gap 长期非零。改为只统计可索引节点。
+- **`causal_density` 空边集必崩**：分母为零未保护。
+- **中断预算重复扣减**：`spend` 前先读数、加锁后再读数，等于读一次扣一次。改为锁内唯一递增。
+- **`cycle_detector` 不区分边类型**：把时序环（before/after）误判为因果环。改为按边类型过滤后跑迭代 Tarjan。
+- **非法输入返回 500 且已写入**：`content=123` 这类输入在 try 之外崩在 `raw_vid` 上，节点却已入库。改为前置校验返回 400，不落库。
+- **标签双转义**：`["a"]` 被 `json.dumps` 两次，读出来是字符串 `"[\"a\"]"`。改为幂等解两层转义 + 写入侧归一。
+- **`/mark` 状态流转不删向量**：节点转 obsolete/merged 后旧向量仍参与检索。改为同步删向量。
+- **状态变更不同步 grade**（第 24 项）：`set_status` / `mark_permanent` / `mark_outdated` / `merge_into` / `archive_nodes` 五个入口都只 `update_node(status)`，grade 留在旧值——生产库实测 6 条不一致（merged 仍是 experience、permanent 仍是 hint）。修法是在 `core.update_node` 锁内、构造字段集之前统一重算，一处兜住五个入口。
+
+### 三、其余修复（按模块）
+
+- `core.py`：`archive_nodes` 未真正归档；`apply_decay` 未跳过 obsolete/merged；`add_edge` 去重与写入分在两个锁；`compute_weight` 用创建时间而非最后活跃时间；`verify_index` 把 merged 计入缺口；补 `duplicate_edges` / `dedup_edges` / `indexable_node_count`。
+- `api.py`：`/episodes` 无 limit 与 count；`/timeline` 改为路径式；`/rebuild` 同步阻塞改异步 202；`/extract` 补参数校验；`/decay` 补归档链；`_read_body` 坏 JSON 返回 400。
+- `time_window.py`：时间解析补五格式；`build_episodes` 幂等键从 `(start,end)` 改为 `start`（窗口后移不再复制一份 episode）；`get_episodes` 默认 200 条。
+- `event_normalizer.py`：时间带秒、边类型别名补 trigger / related 族。
+- `linker.py`：双向边补齐 strength。`extract.py`：补 `return_ids`。
+- `interrupt_budget.py`：`__exit__` 置 closed、`used` 属性、`exhausted` 改纯查询。
+- `analyze_patterns.py`：缺 `import config` 导致必崩；`tag_frequency` 补过滤。
+- `mcp_server.py`：错误码规范为 -32601 / -32602、顶层 error 字段。
+- `node_lifecycle.py`：`merge_into` 删被合并节点向量。
+- `scripts/selfcheck.py`：`duplicate_edges` 从"只报"改为"实删"；7a 项补删向量。
+- `bridge/smem.py`：补 `raw_search`、检索输出 `[判定]` 前置、CLI search 改人类可读。
+
+### 四、升级迁移（升级必跑）
+
+新增 `scripts/migrate_fix_20261113.py`，8 类数据修复，**幂等**，支持 `--dry-run` 预演：
+
+```bash
+python scripts/migrate_fix_20261113.py --db storage/super_memory.db --dry-run
+python scripts/migrate_fix_20261113.py --db storage/super_memory.db --apply
+```
+
+生产库（2149 节点 / 26452 边）实测：标签清洗 110、边类型归一 127、重复边删除 62（4 组）、related strength 回填 25646、节点时间戳 1689、创建/访问时间 749、grade 重算 20、episode 引用修复 1、episode 重复合并 10。**第二次执行全部为 0**。
+
+迁移后可感知变化：episodes 98→87（同起点重复聚合被合并）、related 边 strength 由全 1.0 变为均值 0.698（扩散过滤阈值 0.55 从此真正生效）。
+
+### 五、测试
+
+11 个套件 **178/178 全绿**（约 5 分钟）：模块 25 / HTTP 读 44 / HTTP 写 36 / HTTP 维护 7 / 维护扩展 9 / 缺陷冒烟 17 / 归档链 6 / 生命周期 6 / MCP 11 / CLI 桥接 10 / 重建锚点 7。
+
+### 六、代价（如实记录）
+
+- 交错延迟 p95 263ms → 415ms，均值 137ms → 150ms。
+- 并发：4 并发 p50 382 → 461ms（9.9 → 7.6 qps）；8 并发 563 → 793ms（12.4 → 8.7 qps）。
+- 当前归因为"关键词候选池 320→2000 导致 Python 层构造 Node 增多 + GIL 争用"，**尚未做单变量实验**，列为未闭环项。节点规模到 1 万时需要重设关键词召回策略（SQL 侧预打分 / 分批取 / 命中行数自适应）。
+
+### 改动文件
+
+`config.py` `core.py` `search_fusion.py` `api.py` `anchors.py` `time_window.py` `event_normalizer.py` `linker.py` `extract.py` `cycle_detector.py` `interrupt_budget.py` `analyze_patterns.py` `mcp_server.py` `node_lifecycle.py` `scripts/selfcheck.py` `bridge/smem.py`，新增 `scripts/migrate_fix_20261113.py`。
+
+逐条明细见 [大修修复清单](docs/大修修复清单.md)，实验过程与数据见 [大修后重测报告](docs/大修后重测报告.md)。
+
 ## v1.1.4（2026-11-13）
 
 ### 检索端改造：该答的能答，不该答的说不知道

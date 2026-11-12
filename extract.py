@@ -14,11 +14,18 @@ from core import Edge, MemorySystem, Node
 from rule_extractor import rule_extract
 
 
-def extract_from_text(text, source="manual", project="default", ms=None, dedup=True, write_daily=True):
-    """从一段文本规则提取节点/边候选并入库。返回新增节点数。"""
+def extract_from_text(text, source="manual", project="default", ms=None, dedup=True, write_daily=True,
+                      return_ids=False):
+    """从一段文本规则提取节点/边候选并入库。
+
+    [FIX 2026-11-13 P1] 原来只返回 added(int)，调用方拿不到节点 id：
+      · api.py `/extract` 的 text 分支因此 created_n 有值、verified_n 恒 0（没法逐条读回校验）；
+      · 磁盘记忆回写、MCP、scheduler 也都只能拿到计数。
+    现在新增 return_ids=True 时返回 (added, ids)；默认 False 保持旧调用方（int）不变。"""
     ms = ms or MemorySystem()
     candidates = rule_extract(text, project=project, source=source)
     added = 0
+    ids = []
     for cand in candidates:
         if cand["kind"] != "node":
             continue
@@ -28,6 +35,7 @@ def extract_from_text(text, source="manual", project="default", ms=None, dedup=T
         nid, created = ms.add_node_with_vector(node, dedup=dedup)
         if created:
             added += 1
+            ids.append(nid)
             for e in cand.get("edges", []):
                 # 边指向同批候选中的节点：此处用内容前缀回查真实 id
                 target = _find_node_by_prefix(ms, e["to"].replace("node_ref_", ""), project)
@@ -56,6 +64,8 @@ def extract_from_text(text, source="manual", project="default", ms=None, dedup=T
         _llm_enhance(text, project, source, ms)
     if write_daily:
         _write_daily_memory(text, source, project)
+    if return_ids:
+        return added, ids
     return added
 
 

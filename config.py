@@ -41,10 +41,10 @@ CAUSAL_FACTOR_RATE = 0.3
 CAUSAL_FACTOR_MAX = 1.3   # [FIX 2026-11-07] 原 2.0：0.7*2.0=1.4，任何有边的老条目都会顶格 1.0，新旧无法区分
 NEWNESS_BOOST = 1.2       # 新写入认知的 7 天新近加成，让新结论先压过旧的
 NEWNESS_BOOST_DAYS = 7
-# [UPD 2026-10-28 / FIX 2026-11-07] 访问热度只用于检索排序，不再乘进权重：
-#   原实现 heat = access_count * exp(-ACCESS_HEAT_LAMBDA * 距上次访问天数) 直接乘进
-#   causal_factor，导致"访问越多权重越高"——被反复检索的错误记忆永远顶格、无法退休。
-#   该常量保留供检索侧/历史兼容，compute_weight 已不再引用。
+# [UPD 2026-10-28 剪枝优化] 访问热度随时间衰减（半衰期 ~35 天）：
+#   热度 heat = access_count * exp(-ACCESS_HEAT_LAMBDA * 距上次访问天数)。
+#   修复"访问次数只增不衰"问题：很久以前频繁用、现在不再用的记忆，
+#   其热度加成会随冷落逐渐消退（与遗忘曲线同向，属剪枝类优化，不做加法）。
 ACCESS_HEAT_LAMBDA = 0.02
 # 重要性阶梯：S/A/B/C
 LAMBDA_BY_TYPE = {
@@ -53,7 +53,12 @@ LAMBDA_BY_TYPE = {
     "B": 0.008,    # task
     "C": 0.03,     # insight
 }
-FLOOR_BY_TYPE = {"S": 0.8, "A": 0.35, "B": 0.30, "C": 0.20}
+# [FIX 2026-11-13 P0-1] 权重地板与归档阈值（ARCHIVE_THRESHOLD=0.2）原本数学互斥：
+#   C 级 floor=0.20 恰好等于阈值，B=0.30/A=0.35 高于阈值 → 全库 0 个节点能掉到 0.2 以下，
+#   归档链路成了死代码（实测 2218 节点中 1048 个 weight 精确停在 0.2000）。
+#   现把低价值类型的地板拉开距离：C 0.20→0.05、B 0.30→0.15；A（decision/project）
+#   与 S（permanent）保持高地板，高价值认知不参与自动归档。
+FLOOR_BY_TYPE = {"S": 0.8, "A": 0.35, "B": 0.15, "C": 0.05}
 # 默认级别映射（说明书中未列出的类型给默认值，标注为重建时补充）
 TYPE_LEVEL_DEFAULT = "C"
 TYPE_LEVEL_MAP = {"decision": "A", "project": "A", "task": "B", "insight": "C"}
@@ -74,9 +79,18 @@ RERANK_WEIGHTS = {"vector": 0.50, "weight": 0.25, "edge_count": 0.15, "access": 
 TYPE_BONUS = {"decision": 0.10, "rule": 0.10, "technique": 0.08, "insight": 0.05}
 RECALL_TOP_K = 40
 SEARCH_LIMIT_DEFAULT = 10
+# [FIX 2026-11-13 P0-3] 中文长句切词：原 _tokenize 只按标点/空白切，中文长句整句成一个 token，
+#   FTS 腿的 instr 整串匹配必然 0 命中（7 条难例 6 条整句一 token），连带 judge_verdict 的
+#   lexical support 全失效。现对中文段按 2-4 字滑窗切 gram，整段 token 仍保留（命中给满分）。
+TOKENIZE_CN_MAX_SEG = 4        # 中文段 ≤ 该长度直接整段作 token
+TOKENIZE_CN_GRAMS = (4, 3, 2)  # 长段滑窗宽度（从长到短，长 gram 优先）
+TOKENIZE_CN_STEP = 2           # 滑窗步长
+TOKENIZE_MAX_TOKENS = 24       # 单次查询最多多少个 token（防 SQL OR 条件爆炸）
+SEARCH_TOKEN_MIN_LEN = 2       # 中文 token 最小长度（单字噪声太大，不进 FTS）
+EPISODE_LIMIT_DEFAULT = 200    # [FIX 2026-11-13 P2-13] /episodes 默认返回条数（原 50 条截断）
 
 # ---- 因果链（[FIX] 只沿因果语义边遍历，避免 part_of/evolves_from 稀释因果）----
-CAUSAL_EDGE_TYPES = {"enable", "derives_insight", "refutes", "improves"}
+CAUSAL_EDGE_TYPES = {"enable", "trigger", "derives_insight", "refutes", "improves"}
 CAUSAL_DEPTH = 3
 
 # ---- 语义关联链路（2026-11-03 修复：auto_link 双向化 + related 检索扩散）----
@@ -92,7 +106,15 @@ AUTO_LINK_STRONG_SCORE = 0.70      # 强关联阈值：>=0.70 的候选全建（
 AUTO_LINK_MID_MAX = 3              # 弱关联[0.45,0.70)每节点最多建几条（分层防稀释）
 AUTO_LINK_QUERY_K = 20             # 向量检索候选面（含强+弱候选）
 RELATED_DIFFUSE_ENABLED = True     # 检索侧 related 边扩散开关
-RELATED_DIFFUSE_MAX = 20           # 扩散邻居并入 RRF 的上限（防候选爆炸）
+# [FIX 2026-11-13 P0-2] 扩散路原本与 vector 第 1 名同权（related_rank 从 1 起算 1/(60+rank)，
+#   每查询平均灌 12.8 个候选，实测 20 条 related 边里 7 条完全无关），把正确答案挤出 top1。
+#   现：① 扩散只做"补位"，主路召回过的候选分数完全不受扩散影响（实测扩散原为净拖累：
+#     关掉扩散 @1=53.0%，开着 34.3%，差 22pt 的 top1 被扩散抢走）；
+#      ② 上限 20→8；③ 只扩散强度够的边（弱边不入 RRF）。
+RELATED_DIFFUSE_MAX = 8            # 扩散邻居并入候选池的上限（防候选爆炸）
+RELATED_DIFFUSE_WEIGHT = 0.7       # 扩散分权重系数（只在主路零命中时兜底，单次分量需够大）
+                                   # [FIX 2026-11-13 P0-2b] 每个候选只计一次扩散（不再按命中次数累加）。
+RELATED_DIFFUSE_MIN_STRENGTH = 0.55  # 边的语义强度下限（auto_link 写入时落 strength=score）
 
 # ---- 原文层 verbatim（2026-10-17 新增）----
 # 逐字原文层：日常检索不触碰，强召回（置信低 / 细节追问 / 溯源）才触发。
@@ -138,7 +160,8 @@ TEMPORAL_BEFORE_KEYWORDS = ["之前", "此前", "起初", "最初", "先做了",
 SCENE_LINK_ENABLED = True
 SCENE_ENTITY_TYPES = {"person", "system", "item", "scene", "project", "work", "book", "concept"}
 # 检索场景过滤（scene 参数）默认关闭——显式传 scene= 才生效
-SCENE_SEARCH_WEIGHT = 0.35                   # 场景命中邻居在 RRF 中的额外权重系数
+SCENE_SEARCH_WEIGHT = 0.18                   # 场景命中邻居在 RRF 中的额外权重系数
+                                             # [FIX 2026-11-13] 0.35→0.18：单路边邻居分不应超过 RRF 第 1 名的 20%
 
 # ---- 价值/目标维（2026-10-20 新增）----
 # importance 价值分级：goal_related（直接服务当前目标，检索最高优先）/
@@ -148,8 +171,9 @@ SCENE_SEARCH_WEIGHT = 0.35                   # 场景命中邻居在 RRF 中的�
 IMPORTANCE_LEVELS = ("goal_related", "operational", "reference")
 GOAL_LINK_ENABLED = True                       # 写入时自动检测目标/愿望/里程碑短语 → goal 节点 + contributes_to 边
 GOAL_SEARCH_ENABLED = True
-GOAL_SEARCH_WEIGHT = 0.40                    # contributes_to 邻居加权系数
-GOAL_BLOCK_PENALTY = 0.35                    # blocks 邻居降权系数
+GOAL_SEARCH_WEIGHT = 0.20                    # contributes_to 邻居加权系数
+                                             # [FIX 2026-11-13] 0.40→0.20（同上：边路不得压过正路）
+GOAL_BLOCK_PENALTY = 0.20                    # blocks 邻居降权系数
 
 # ---- 状态维（2026-10-20 新增）----
 # 状态快照：state 节点记录 agent/世界的当前态势认知（"任务 X 进行中"、"设备离线"等）。
@@ -161,7 +185,7 @@ STATE_TRANSITION_KEYWORDS = ["状态变为", "状态变成", "状态切换到", 
                              "切换为", "状态改为", "状态改成", "改为", "进入",
                              "switched to", "transitioned to", "changed to", "turned into"]
 # 状态检索（state 参数）：state=状态名 → 沿 transitions_to 带出"导致该状态"的事件/节点
-STATE_SEARCH_WEIGHT = 0.35
+STATE_SEARCH_WEIGHT = 0.18          # [FIX 2026-11-13] 0.35→0.18（边路不得压过正路）
 # 自动创建 state 节点的 importance 默认值（状态快照对决策有用 → operational）
 STATE_NODE_IMPORTANCE = "operational"
 
@@ -238,8 +262,11 @@ EDGE_TYPES = ["part_of", "derives_insight", "applies", "improves", "evolves_from
               "before", "after", "superseded_by",
               "involves", "occurred_in",
               "contributes_to", "blocks",
-              "transitions_to"]
-
+              "transitions_to",
+              # [FIX 2026-11-13 P1-4] 补 trigger / enable：此前白名单缺这两类，
+              #   normalize_edge_type 先查白名单未命中就落 related，导致 /extract 与
+              #   /sync/apply 提交的因果边全部被压平成 related（全库 97.6% related 的根源）。
+              "trigger", "enable"]
 
 
 # =====================================================================
@@ -286,11 +313,15 @@ VERDICT_LEXICAL_MIN = 0.6             # 字面命中强度达到这个值才算"
 # ---- ③ 实体钩子层（anchor hook）：写入时建表，检索时查表 ----
 ANCHOR_ENABLED = True
 ANCHOR_SEARCH_WEIGHT = 0.55           # 钩子命中在 RRF 中的权重（锚定效应高于普通一路召回）
-ANCHOR_BOOST = 0.03                   # [UPD 2026-11-12] 钩子命中的定值加成：能进表的词已过 df 闸门，
-                                      # 但加成必须按"绑定强度"给（min(1, strength/4)），不能按命中词数给，
-                                      # 否则只在 tags 蹭到实体词的节点会被顶到 top1。0.02 实测会丢失
-                                      # 小妖/Strata 的 top1 换准效果，0.03 为当前最优。
-                                      # 命中即强信号；只靠 RRF 的 1/(60+rank) 压不过向量噪声。
+ANCHOR_BOOST = 0.03                   # [已弃用 2026-11-13 P0-2] 定值加成改为下面两个参数；
+                                      # 保留常量仅为兼容旧引用
+# [FIX 2026-11-13 P0-2] 定值 0.03 相对 RRF 基准 1/61=0.0164 是 +83% 的固定加成——
+#   一条只靠钩子命中的节点（rrf=0）能直接 +0.03 顶到第 1 名之外的所有正常结果前面，
+#   实测挤掉 10 条本该第一的正确答案（相似度 0.736/0.607/0.58）。
+#   现改为"相对加成 + 小额绝对底"：乘性只在节点已有排序地位时放大（锚定=确认不是创造），
+#   绝对底 0.004 约等于 RRF 第 40 名的水平，只够把纯钩子命中拉进候选池，拉不到前排。
+ANCHOR_BOOST_REL = 0.35               # 乘性加成上限：base = rrf*(1+0.35*strength)
+ANCHOR_BOOST_ABS = 0.004              # 绝对底：纯钩子命中最多 +0.004
 ANCHOR_MIN_TERM_LEN = 2               # 中文最小字数
 ANCHOR_MAX_TERM_LEN = 12              # 最长词条（防整句入表）
 ANCHOR_MAX_TERMS_PER_NODE = 12        # 单节点最多抽几个钩子

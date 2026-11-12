@@ -88,12 +88,42 @@ def gen_assoc_queries(q):
     return _assoc_call(q)
 
 
-def _recency_score(node):
-    """时效性：按事件时间距今的月数做指数衰减（30 天半衰）"""
+_TS_FMTS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M", "%Y-%m-%d")
+
+
+def _parse_dt_any(s):
+    """[FIX 2026-11-13] 时间容错解析：返回 datetime 或 None。
+
+    原 _recency_score / _time_bonus 在解析失败时一律退化成 datetime.now()，
+    等于把"时间未知"当成"刚刚发生"——格式不认识的旧节点白拿满分新鲜度，
+    在 recency=1 模式下直接把老记忆顶到前排。现在失败返回 None，由调用方给中性分。"""
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(s))
+        except (ValueError, OSError, OverflowError):
+            return None
+    s = str(s).strip()
+    if not s:
+        return None
+    for fmt in _TS_FMTS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
     try:
-        ts = datetime.strptime(node.timestamp, "%Y-%m-%d %H:%M")
-    except (ValueError, TypeError):
-        ts = datetime.now()
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _recency_score(node):
+    """时效性：按事件时间距今的月数做指数衰减（30 天半衰）。时间未知给中性 0.5。"""
+    ts = _parse_dt_any(getattr(node, "timestamp", None))
+    if ts is None:
+        return 0.5
     hours = max(0.0, (datetime.now() - ts).total_seconds() / 3600.0)
     return math.exp(-hours / (24.0 * 30.0))
 
@@ -115,13 +145,70 @@ def _normalize(x, cap):
         return 0.0
 
 
+_CN_RE = re.compile(r"[\u4e00-\u9fff]+")
+_LATIN_RE = re.compile(r"[a-z0-9][a-z0-9._:/+#]*")
+_SPLIT_RE = re.compile(r"[\s,，。；;:：!！?？()（）\[\]{}<>《》\"'、/\\|_\-—…]+")
+
+
 def _tokenize(q):
-    """把查询词拆成小写 token（中英文通用），并返回整句小写。"""
+    """把查询拆成 token 并返回整句小写：非中文串整段保留，中文段切 2-4 字 gram。
+
+    [FIX 2026-11-13 P0-3] 原实现只按标点/空白切：中文长句（"为什么向量索引重建之后
+    缺口反而变大了"）整句成为一个 token，而 FTS 腿是用 instr 做整串子串匹配，
+    长句必然 0 命中——7 条难例里 6 条整句一 token，judge_verdict 的 lexical support
+    随之全灭。现在中文按短段整取 + 长段滑窗切 gram，单字噪声丢弃。"""
     ql = q.strip().lower()
     if not ql:
         return [], ql
-    toks = [t for t in re.split(r"[\s,，。；;:：!！?？()（）\[\]{}<>《》\"'、/\\|_\-]+", ql) if t]
-    return toks, ql
+    toks = []
+    seen = set()
+
+    def _add(t):
+        if not t or t in seen:
+            return False
+        if len(t) > 64:
+            return False
+        if len(t) == 1 and _CN_RE.match(t):
+            return False          # 中文单字噪声大，不进 FTS
+        seen.add(t)
+        toks.append(t)
+        return True
+
+    for seg in _SPLIT_RE.split(ql):
+        if not seg or len(toks) >= config.TOKENIZE_MAX_TOKENS:
+            break
+        if not _CN_RE.search(seg):
+            _add(seg)
+            continue
+        # 混排段落：先保留英文/型号片段（AIGC_Hub、125B、RTX4070 之类）
+        for lat in _LATIN_RE.findall(seg):
+            if _add(lat) and len(toks) >= config.TOKENIZE_MAX_TOKENS:
+                break
+        for cns in _CN_RE.findall(seg):
+            if _add(cns) and len(toks) >= config.TOKENIZE_MAX_TOKENS:
+                break
+            L = len(cns)
+            if L <= config.TOKENIZE_CN_MAX_SEG:
+                for i in range(L - 1):
+                    bg = cns[i:i + 2]
+                    if bg not in config.ANCHOR_STOPWORDS:
+                        if _add(bg) and len(toks) >= config.TOKENIZE_MAX_TOKENS:
+                            break
+                continue
+            stop = False
+            for w in config.TOKENIZE_CN_GRAMS:
+                if w > L or stop:
+                    break
+                for i in range(0, L - w + 1, config.TOKENIZE_CN_STEP):
+                    g = cns[i:i + w]
+                    if g in config.ANCHOR_STOPWORDS:
+                        continue
+                    if _add(g) and len(toks) >= config.TOKENIZE_MAX_TOKENS:
+                        stop = True
+                        break
+            if stop:
+                break
+    return toks[:config.TOKENIZE_MAX_TOKENS], ql
 
 
 def _node_turn(node):
@@ -155,6 +242,15 @@ def _fts_recall(ms, q, project=None, top_k=config.RECALL_TOP_K, max_turn=None):
         sql += " AND project=?"
         args.append(project)
     sql += " AND (" + " OR ".join(conds) + ") ORDER BY timestamp DESC"
+    # [FIX 2026-11-13 P0-3] 中文切词后 token 变多（最多 24 个 OR 条件 × 2），长句命中行可能上千；
+    # 在 SQL 层先截断再算分，避免把整库命中行全转成 Node。
+    # [FIX 2026-11-13 P0-3b] 截断值原为 max(64, top_k*8)=320 —— 但配合 ORDER BY timestamp DESC，
+    #   等于"只保留最新的 320 条命中行"，老节点（正确答案常在其中）被整批丢掉。
+    #   实测：134 题自召回 @1 因此从 65.4% 掉到 53.0%。改为主库规模内的足量窗口。
+    #   窗口 2000 时 @1=74.6%；收到 800 后 @1 反而跌到 72.4%，p95 无变化（415→422ms）——
+    #   说明 p95 不是这个窗口造成的，质量优先取 2000。
+    sql += " LIMIT ?"
+    args.append(max(2000, int(top_k) * 8))
     rows = ms.graph.conn.execute(sql, args).fetchall()
     hits = []
     for r in rows:
@@ -167,26 +263,32 @@ def _fts_recall(ms, q, project=None, top_k=config.RECALL_TOP_K, max_turn=None):
         tl = " ".join(node.tags or []).lower()
         if ql in cl or ql in tl:
             hits.append((node, 1.0))
-        else:
-            n = sum(1 for t in toks if t in cl or t in tl)
-            if n >= 1:
-                hits.append((node, 0.6 + 0.4 * (n / len(toks))))
+            continue
+        matched = [t for t in toks if t in cl or t in tl]
+        if not matched:
+            continue
+        # [FIX 2026-11-13 P0-3] 命中门槛：至少一个 ≥2 字的 gram，且"命中 2 个以上 token
+        # 或命中最长 gram ≥4 字"——否则"记忆""系统"这种高频二字词会让半库节点拿 0.6 分。
+        longest = max(len(t) for t in matched)
+        if not (len(matched) >= 2 or longest >= 4):
+            continue
+        score = 0.6 + 0.4 * (len(matched) / float(len(toks)))
+        if longest >= 4:
+            score = max(score, 0.85)   # 长 gram 命中比碎词命中可信
+        hits.append((node, min(1.0, score)))
     hits.sort(key=lambda x: x[1], reverse=True)
     return hits[:top_k]
 
 
 def _time_bonus(node):
-    """时间加成：按写入时间（created_at）新鲜度衰减，1 - 0.01/天，最低 0.2 保底。"""
-    s = getattr(node, "created_at", None) or node.timestamp
-    dt = None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            break
-        except (ValueError, TypeError):
-            continue
+    """时间加成：按写入时间（created_at）新鲜度衰减，1 - 0.01/天，最低 0.2 保底。
+
+    [FIX 2026-11-13] 原实现只认 3 种格式、失败取 now——与 _recency_score 同一个病：
+    格式不认识的老节点拿到满分时间加成。现在走 _parse_dt_any，未知时间给中性 0.5。"""
+    s = getattr(node, "created_at", None) or getattr(node, "timestamp", None)
+    dt = _parse_dt_any(s)
     if dt is None:
-        dt = datetime.now()
+        return 0.5
     days = max(0.0, (datetime.now() - dt).total_seconds() / 86400.0)
     return max(0.2, 1.0 - days * 0.01)
 
@@ -313,9 +415,15 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
     #    这类同事件多口径记忆分离；开启后命中节点直接带出语义邻居。
     if config.RELATED_DIFFUSE_ENABLED:
         related_rank = 0
+        min_strength = float(getattr(config, "RELATED_DIFFUSE_MIN_STRENGTH", 0.0))
+        weight = float(getattr(config, "RELATED_DIFFUSE_WEIGHT", 1.0))
         for nid in causal_seeds:
             for e in ms.graph.out_edges(nid):
                 if e.edge_type != "related":
+                    continue
+                # [FIX 2026-11-13 P0-2] 只扩散强度够的边：auto_link 的 0.45-0.55 弱边
+                # 实测 20 条里 7 条完全无关，全额扩散等于往候选池灌噪声。
+                if float(getattr(e, "strength", 1.0) or 0) < min_strength:
                     continue
                 nn = ms.graph.get_node(e.to_id)
                 if not nn or nn.status == "obsolete" or not allow(nn):
@@ -323,7 +431,14 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
                 related_rank += 1
                 rec = ensure(nn.id, nn)
                 rec["related"] += 1
-                rec["rrf"] += 1.0 / (60.0 + related_rank)
+                # [FIX 2026-11-13 P0-2b] 同一候选只计一次扩散分量：原实现每命中一次就累加，
+                # 热门邻居被 20 个种子（vec top10 + fts top10）反复命中后 RRF 叠到 0.02+，
+                # 直接顶掉向量第 1 名——这正是"关掉扩散反而更准"的机制。
+                if rec["related"] == 1:
+                    # [FIX 2026-11-13 P0-2c] 扩散分单独记账，不并进主 RRF：
+                    #   主路候选（vector/fts/anchor 命中）的分数完全不受扩散影响，
+                    #   扩散分只用来把"主路一条没召回到"的邻居补进候选池（只补位）。
+                    rec["related_rrf"] = rec.get("related_rrf", 0.0) + weight * (1.0 / (60.0 + related_rank))
                 if related_rank >= config.RELATED_DIFFUSE_MAX:
                     break
             if related_rank >= config.RELATED_DIFFUSE_MAX:
@@ -331,13 +446,22 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
             for e in ms.graph.in_edges(nid):
                 if e.edge_type != "related":
                     continue
+                if float(getattr(e, "strength", 1.0) or 0) < min_strength:
+                    continue
                 nn = ms.graph.get_node(e.from_id)
                 if not nn or nn.status == "obsolete" or not allow(nn):
                     continue
                 related_rank += 1
                 rec = ensure(nn.id, nn)
                 rec["related"] += 1
-                rec["rrf"] += 1.0 / (60.0 + related_rank)
+                # [FIX 2026-11-13 P0-2b] 同一候选只计一次扩散分量：原实现每命中一次就累加，
+                # 热门邻居被 20 个种子（vec top10 + fts top10）反复命中后 RRF 叠到 0.02+，
+                # 直接顶掉向量第 1 名——这正是"关掉扩散反而更准"的机制。
+                if rec["related"] == 1:
+                    # [FIX 2026-11-13 P0-2c] 扩散分单独记账，不并进主 RRF：
+                    #   主路候选（vector/fts/anchor 命中）的分数完全不受扩散影响，
+                    #   扩散分只用来把"主路一条没召回到"的邻居补进候选池（只补位）。
+                    rec["related_rrf"] = rec.get("related_rrf", 0.0) + weight * (1.0 / (60.0 + related_rank))
                 if related_rank >= config.RELATED_DIFFUSE_MAX:
                     break
             if related_rank >= config.RELATED_DIFFUSE_MAX:
@@ -445,19 +569,23 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
         node = rec["node"]
         rec["time_bonus"] = _time_bonus(node)
         base = rec["rrf"]
+        if not base and rec.get("related_rrf"):
+            # 主路一条没命中、只由 related 扩散带出来的候选：用扩散分兜底（只补位）
+            base = rec["related_rrf"]
         if rec.get("anchor"):
-            # 钩子加成按"绑定强度"算：只在 tags 里蹭到的弱绑定几乎不加分，
-            # 标题位/专名节点的强绑定才给满额 —— 否则泛标签会把噪声顶到 top1
-            base += config.ANCHOR_BOOST * min(1.0, float(rec.get("anchor_strength", 0) or 0) / 4.0)
+            # [FIX 2026-11-13 P0-2] 钩子加成从"定值 0.03"改为"相对加成 + 小额绝对底"：
+            #   乘性项只放大节点已有的排序地位（锚定 = 确认，不是凭空创造排序）；
+            #   绝对底 0.004 只够把纯钩子命中拉进候选池，拉不到前排。
+            #   旧实现 0.03 相对 RRF 基准 1/61≈0.0164 是 +83%，实测挤掉 10 条本该第一的答案。
+            s = min(1.0, float(rec.get("anchor_strength", 0) or 0) / 4.0)
+            base = base * (1.0 + config.ANCHOR_BOOST_REL * s) + config.ANCHOR_BOOST_ABS * s
         if recency:
             in_window = 0.0
-            try:
-                ts = datetime.strptime(node.timestamp, "%Y-%m-%d %H:%M")
+            ts = _parse_dt_any(getattr(node, "timestamp", None))
+            if ts is not None:
                 days_ago = max(0.0, (datetime.now() - ts).total_seconds() / 86400.0)
                 if days_ago <= window_days:
                     in_window = 0.15
-            except (ValueError, TypeError):
-                pass
             rec["recall_score"] = base * (0.4 + 0.6 * rec["time_bonus"]) + in_window
         else:
             rec["recall_score"] = base * (0.6 + 0.4 * rec["time_bonus"])
@@ -467,13 +595,29 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
             rec["tilt_boost"] = boost
             rec["recall_score"] = rec["recall_score"] * boost
         out.append(rec)
-    out.sort(key=lambda c: c["recall_score"], reverse=True)
+    # [FIX 2026-11-13 P0-2c] related 扩散只做"补位"，不参与主排序：
+    #   实测（134 题自召回）关掉扩散 @1=53.0%，开着 @1=34.3%——扩散把 22pt 的正确答案
+    #   挤出了 top1。根因不是权重大小，而是"仅由扩散召回的候选"和主路候选同池竞争。
+    #   改成分段排序（key 见 _final_order_key）：主路命中优先，仅扩散召回的排其后，
+    #   仍能补足 @10 的召回，但抢不走 top1。
+    out.sort(key=_final_order_key)
     return out[:top_k]
 
 
+def _final_order_key(c):
+    """最终排序 key：有任何主路命中的候选优先，仅由 related 扩散召回的候选排在其后。
+
+    [FIX 2026-11-13 P0-2c] 扩散只补位（补 @10 的召回），不参与主排序抢 top1。
+    """
+    has_main = bool(c.get("vector_score") or c.get("fts_score") or c.get("anchor")
+                    or c.get("causal") or c.get("assoc") or c.get("scene")
+                    or c.get("goal") or c.get("goal_block") or c.get("state"))
+    return (0 if has_main else 1, -c["recall_score"])
+
+
 def rerank(ms, cands, top_n=config.SEARCH_LIMIT_DEFAULT):
-    """精排：直接按 RRF 融合分（含时间加成）取 Top N。"""
-    cands.sort(key=lambda c: c["recall_score"], reverse=True)
+    """精排：按 RRF 融合分（含时间加成）取 Top N，保持"主路优先 / 扩散补位"的分段。"""
+    cands.sort(key=_final_order_key)
     return cands[:top_n]
 
 
@@ -679,11 +823,8 @@ def forgotten_nodes(ms, threshold=config.ARCHIVE_THRESHOLD, half_life_days=None)
             continue
         w = n.weight
         if half_life_days:
-            try:
-                ts = datetime.strptime(n.timestamp, "%Y-%m-%d %H:%M")
-            except (ValueError, TypeError):
-                ts = datetime.now()
-            days = max(0.0, (datetime.now() - ts).total_seconds() / 86400.0)
+            ts = _parse_dt_any(getattr(n, "timestamp", None))
+            days = 0.0 if ts is None else max(0.0, (datetime.now() - ts).total_seconds() / 86400.0)
             w = w * (0.5 ** (days / float(half_life_days)))
         if w < threshold:
             out.append({"id": n.id, "content": n.content[:80], "weight": round(w, 3),

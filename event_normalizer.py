@@ -9,15 +9,36 @@ from datetime import datetime
 import config
 
 
+_NOW_FMT = "%Y-%m-%d %H:%M:%S"
+
+
 def normalize_timestamp(ts):
-    """归一为 YYYY-MM-DD HH:MM；非法输入回退为当前时间。"""
-    if not ts:
-        return datetime.now().strftime("%Y-%m-%d %H:%M")
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})", str(ts))
+    """归一为 YYYY-MM-DD HH:MM:SS。
+
+    [FIX 2026-11-13 P2-18] 原实现输出 "%Y-%m-%d %H:%M"（无秒），与 Node.created_at
+    的带秒格式、以及库里已有的 ISO 带 T / epoch 数字混成 4 种写法，跨格式比较全靠
+    各处自己写容错。现在统一带秒，并接受 epoch（int/float/纯数字串）、ISO（含 T、
+    含时区）、纯日期；真的无法解析才回退 now。"""
+    if ts is None or ts == "":
+        return datetime.now().strftime(_NOW_FMT)
+    if isinstance(ts, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(ts)).strftime(_NOW_FMT)
+        except (ValueError, OSError, OverflowError):
+            return datetime.now().strftime(_NOW_FMT)
+    s = str(ts).strip()
+    if re.match(r"^\d{10}(\.\d+)?$", s):
+        try:
+            return datetime.fromtimestamp(float(s)).strftime(_NOW_FMT)
+        except (ValueError, OSError, OverflowError):
+            return datetime.now().strftime(_NOW_FMT)
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?", s)
     if m:
-        y, mo, d, h, mi = m.groups()
-        return f"{y}-{mo}-{d} {int(h):02d}:{mi}"
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+        y, mo, d, h, mi, sec = m.groups()
+        return f"{y}-{mo}-{d} {int(h):02d}:{mi}:{int(sec or 0):02d}"
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return f"{s} 00:00:00"
+    return datetime.now().strftime(_NOW_FMT)
 
 
 def normalize_node_type(t):
@@ -44,6 +65,12 @@ def normalize_node_type(t):
 
 
 def normalize_edge_type(t):
+    """边类型归一：先精确匹配 config.EDGE_TYPES，再查中英文别名表，未知归 related。
+
+    [FIX 2026-11-13 P1-4] 原实现把 trigger 压平成 related：config.EDGE_TYPES 里既无
+    trigger 也无 enable，别名表里也没有 trigger 的任何写法，于是"触发/原因/causes"
+    提交上来全落成 related——因果链断裂，CausalEngine 拿不到边。config 已补
+    trigger/enable，这里补对应中英文别名。"""
     t = (t or "").strip().lower()
     if t in config.EDGE_TYPES:
         return t
@@ -53,7 +80,12 @@ def normalize_edge_type(t):
              "同主题": "shares_theme_with", "相关": "related", "合并": "merged_into",
              "取代": "replaced_by", "使用规则": "uses_rule", "包含技法": "contains_technique",
              "反驳": "refutes", "使能": "enable", "导致": "enable", "enable": "enable",
-             "derived_from": "derives_insight", "relates_to": "related",
+             "derived_from": "derives_insight", "relates_to": "related", "relate": "related",
+             "关联": "related", "有关系": "related",
+             # [FIX 2026-11-13 P1-4] 因果触发类（原来全被压平成 related）
+             "触发": "trigger", "引发": "trigger", "起因": "trigger", "原因": "trigger",
+             "triggered_by": "trigger", "causes": "trigger", "cause": "trigger",
+             "trigger": "trigger", "leads_to": "trigger",
              # [UPD 2026-10-20 时间维] 时序连接词归一
              "之前": "before", "此前": "before", "起初": "before", "最初": "before",
              "之后": "after", "后来": "after", "随后": "after", "此后": "after",

@@ -6,13 +6,21 @@
 from collections import Counter
 from datetime import datetime
 
+import config   # [FIX 2026-11-13 P1-7] 原来漏 import，causal_density 一调就 NameError
 from core import MemorySystem, weight_zone
 
 
 def tag_frequency(ms, top=20):
+    """高频标签。过滤纯标点/空白标签：历史上 tags 被二次 JSON 编码过（105 条），
+    解码后残留 `"` `,` 这类碎片，否则统计表会出现 `('"', 462)` 的假热门。"""
     c = Counter()
     for n in ms.graph.list_nodes(limit=100000):
         for t in (n.tags or []):
+            t = str(t).strip()
+            if len(t) < 2:
+                continue
+            if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in t):
+                continue
             c[t] += 1
     return c.most_common(top)
 

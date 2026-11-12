@@ -59,16 +59,23 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_body(self):
+        """[FIX 2026-11-13 P1-10] 严格解析请求体：坏 JSON / 非对象一律抛 ValueError，
+        由 do_POST 转 400。原实现吞掉异常返回 {}，于是 `[]` 这种合法 JSON 到了
+        `node_data.get(...)` 才崩成 500，报错信息还完全对不上。"""
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             n = 0
         if n <= 0:
             return {}
+        raw = self.rfile.read(n)
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
+            obj = json.loads(raw.decode("utf-8"))
         except Exception:
-            return {}
+            raise ValueError("invalid JSON body")
+        if not isinstance(obj, dict):
+            raise ValueError("body must be a JSON object")
+        return obj
 
     def _params(self):
         u = urllib.parse.urlparse(self.path)
@@ -84,9 +91,15 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 s = ms.graph.stats()
                 vc = ms.vector.count()
+                # [FIX 2026-11-13 P1-6] gap 口径改为"可索引节点 - 已索引"（可索引集合排除
+                # obsolete/merged，与 rebuild_vector_index 一致）；原来用 nodes - vc，
+                # 这两个被排除的状态永远算作缺口，/rebuild 之后反而从 3 涨到 7 归不了零。
+                indexable = ms.graph.indexable_node_count()
                 return self._send(200, {"status": "ok", "nodes": s["nodes"], "edges": s["edges"],
                                         "episodes": s["episodes"], "by_status": s["by_status"],
-                                        "vector_indexed": vc, "vector_gap": max(0, s["nodes"] - vc)})
+                                        "indexable_nodes": indexable,
+                                        "vector_indexed": vc,
+                                        "vector_gap": max(0, indexable - vc)})
             if path.startswith("/nodes/"):
                 nid = urllib.parse.unquote(path[len("/nodes/"):])
                 node = ms.graph.get_node(nid)
@@ -153,11 +166,20 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, time_window.timeline(ms, start, end,
                                                             project=project, q=q))
             if path == "/episodes":
-                return self._send(200, {"episodes": time_window.get_episodes(ms)})
+                # [FIX 2026-11-13 P2-13] 默认 limit 50 截断（库内 98 条时只返回前 50），
+                # 且没有 limit 参数；现在支持 limit（默认 config.EPISODE_LIMIT_DEFAULT=200），
+                # 并回传 count 便于调用方判断是否被截断。
+                limit = int((qs.get("limit") or [config.EPISODE_LIMIT_DEFAULT])[0])
+                eps = time_window.get_episodes(ms, limit=limit)
+                return self._send(200, {"episodes": eps, "count": len(eps)})
             if path.startswith("/episodes/"):
                 eid = path[len("/episodes/"):]
                 ep = next((e for e in time_window.get_episodes(ms, limit=500) if e["id"] == eid), None)
-                return self._send(200, ep if ep else {"error": "not found"})
+                # [FIX 2026-11-13 P2-14] 不存在时返回 200 + {"error": ...} 会让客户端
+                # 误判成功（HTTP 状态才是契约）；改为 404。
+                if not ep:
+                    return self._send(404, {"error": "not found", "id": eid})
+                return self._send(200, ep)
             if path == "/forgotten":
                 threshold = float((qs.get("threshold") or [config.ARCHIVE_THRESHOLD])[0])
                 hl = (qs.get("half_life") or [None])[0]
@@ -182,6 +204,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # [2026-10-29 新增] 库统计（只读）：节点/边/类型/项目分布
                 s = ms.graph.stats()
                 vc = ms.vector.count()
+                indexable = ms.graph.indexable_node_count()
                 by_type = {}
                 for r in ms.graph.conn.execute(
                         "SELECT node_type, COUNT(*) AS c FROM nodes GROUP BY node_type"):
@@ -193,7 +216,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"nodes": s["nodes"], "edges": s["edges"],
                                         "episodes": s["episodes"], "by_status": s["by_status"],
                                         "by_type": by_type, "by_project": by_project,
-                                        "vector_indexed": vc, "vector_gap": max(0, s["nodes"] - vc)})
+                                        "indexable_nodes": indexable,
+                                        "vector_indexed": vc,
+                                        # [FIX 2026-11-13 P1-6] 同 /health：按可索引集合算缺口
+                                        "vector_gap": max(0, indexable - vc)})
             if path == "/metrics":
                 return self._send(200, metrics_mod.full_report(ms))
             if path == "/sessions":
@@ -209,6 +235,10 @@ class _Handler(BaseHTTPRequestHandler):
                 nid = (qs.get("node_id") or [None])[0]
                 return self._send(200, {"verbatim": ms.graph.list_verbatim_by_node(nid) if nid else []})
             return self._send(404, {"error": "no such endpoint"})
+        except ValueError as e:
+            # [FIX 2026-11-13 P2-15] 查询参数类型错误（recency=abc、goal=abc）原来一路
+            # 冒到 except Exception 变成 500 "invalid literal for int()"。现在统一 400。
+            return self._send(400, {"error": "bad parameter: %s" % e})
         except Exception as e:
             return self._send(500, {"error": str(e)})
 
@@ -217,17 +247,20 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._auth():
             return self._send(401, {"error": "unauthorized"})
         path, _ = self._params()
-        body = self._read_body()
         try:
+            body = self._read_body()   # [FIX 2026-11-13 P1-10] 移进 try，坏请求体由下面转 400
             ms = self.ms
             if path == "/nodes":
-                node = Node(content=body.get("content", ""), node_type=body.get("node_type", "event"),
+                c = body.get("content")
+                # [FIX 2026-11-13 P1-10] 类型/空值前置校验：content=123 原来直接进 Node，
+                # 后续 .encode() 崩在 try 外的 raw_vid 上（500 却已经入库一条节点）。
+                if not isinstance(c, str) or not c.strip():
+                    return self._send(400, {"error": "content must be a non-empty string"})
+                node = Node(content=c, node_type=body.get("node_type", "event"),
                             project=body.get("project", "default"), tags=body.get("tags", []),
                             source=body.get("source", "api"), confidence=body.get("confidence", 1.0),
                             timestamp=body.get("timestamp"),
                             importance=body.get("importance"))  # [价值维] goal_related/operational/reference
-                if not node.content:
-                    return self._send(400, {"error": "content required"})
                 nid, created = ms.add_node_with_vector(node)
                 # [2026-10-29 借鉴 digital-life-core v0.9.19] 写入回执验证：
                 # 写完按原文读回（SQLite 主键直读），saved 是唯一判定依据；
@@ -244,6 +277,7 @@ class _Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 # [2026-10-17] 日常写入自动落原文层：content 哈希幂等 vid，node_id 双向指针
+                raw_vid = None
                 try:
                     raw_vid = "v_" + hashlib.sha1(node.content.encode("utf-8")).hexdigest()[:12]
                     ms.add_verbatim(node.content, source=node.source or "api", node_id=nid,
@@ -258,8 +292,15 @@ class _Handler(BaseHTTPRequestHandler):
                 verified_n = 0
                 raw_vids = []
                 if body.get("text"):
-                    created_n += extract.extract_from_text(body["text"], source=body.get("source", "api"),
-                                                           project=body.get("project", "default"), ms=ms)
+                    # [FIX 2026-11-13 P1] 走 return_ids=True，逐条读回校验：
+                    # 原来只拿到 int，verified_n 在这条分支上恒为 0，等于假报"0 条存住"。
+                    n_txt, txt_ids = extract.extract_from_text(
+                        body["text"], source=body.get("source", "api"),
+                        project=body.get("project", "default"), ms=ms, return_ids=True)
+                    created_n += n_txt
+                    for tid in txt_ids:
+                        if ms.graph.get_node(tid) is not None:
+                            verified_n += 1
                     # [2026-10-17] 原始话术自动落原文层（逐字不压缩，哈希幂等）
                     try:
                         txt = body["text"]
@@ -377,6 +418,14 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "action(id) required"})
                 ok = fn(ms, nid)
                 node = ms.graph.get_node(nid)
+                # [FIX 2026-11-13 P1-12] 状态置为 obsolete / merged 后同步删向量：
+                # /decay 会删向量，/mark 不会 → 同一语义两种结果，vector_gap 与检索一致性都乱。
+                # 向量清理集中在 API 层做，node_lifecycle 保持纯状态职责。
+                if ok and node and node.status in ("obsolete", "merged"):
+                    try:
+                        ms.vector.delete(nid)
+                    except Exception:
+                        pass
                 return self._send(200, {"ok": ok, "status": node.status if node else None})
             if path == "/decay":
                 archived = ms.graph.apply_decay()
@@ -386,8 +435,11 @@ class _Handler(BaseHTTPRequestHandler):
                         ms.vector.delete(nid)
                 return self._send(200, {"decayed": True, "archived_count": len(archived)})
             if path == "/episodes/build":
-                n = time_window.build_episodes(ms)
-                return self._send(200, {"episodes_created": n})
+                stats = time_window.build_episodes(ms, return_stats=True)
+                # [FIX 2026-11-13] 同段窗口只刷新不新增，把 updated 一并回传，便于确认幂等
+                return self._send(200, {"episodes_created": stats["created"],
+                                        "episodes_updated": stats["updated"],
+                                        "episodes_unchanged": stats["unchanged"]})
             if path == "/selfcheck":
                 from selfcheck import run_selfcheck
                 report = run_selfcheck(ms, dry_run=body.get("dry_run", False))
@@ -402,6 +454,10 @@ class _Handler(BaseHTTPRequestHandler):
                 p = backup_now(ms)
                 return self._send(200, {"backup": p or "failed"})
             return self._send(404, {"error": "no such endpoint"})
+        except ValueError as e:
+            # [FIX 2026-11-13 P1-10] 请求体非法（坏 JSON / 非对象 / content 类型错）→ 400，
+            # 不再落到 500 让调用方分不清"参数错"还是"服务崩"。
+            return self._send(400, {"error": str(e)})
         except Exception as e:
             return self._send(500, {"error": str(e)})
 

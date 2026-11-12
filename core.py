@@ -31,7 +31,10 @@ class Node:
         self.content = content
         self.node_type = node_type
         self.status = status
-        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M")
+        # [FIX 2026-11-13 P2-18] 时间格式统一到秒：原默认 "%Y-%m-%d %H:%M" 与 created_at
+        # 的 "%Y-%m-%d %H:%M:%S" 不一致，再叠加 ISO 带 T 和 epoch，库里混了 4 种写法，
+        # timeline 区间比较和 episode 聚合都在赌格式。
+        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.weight = weight
         self.project = project
         self.tags = tags or []
@@ -211,6 +214,26 @@ def _age_days(node, now_ts=None):
     return max(0.0, (now - created).total_seconds() / 86400.0)
 
 
+def _last_active_days(node, now_ts=None):
+    """距最近一次激活（写入或访问）的天数。
+
+    [FIX 2026-11-13 P0-1b] 遗忘曲线的 t 原来是「创建至今」，于是任何 C 级事件满 100 天
+    必然 e^(-0.03*100)=0.05 触底。实测全库 2149 条里有 1049 条（49%）会被一次性判死，
+    而这批节点 access_count 6~108、last_accessed 就在当天——等于把"天天在用的记忆"
+    按创建日期沉底。语义上衰减应看「多久没被想起」而不是「多久前写下的」，所以 t 取
+    last_accessed / created_at / timestamp 三者的最晚值：被检索过的记忆重新计时。
+    """
+    now = _parse_ts(now_ts) or datetime.now()
+    latest = None
+    for attr in ("last_accessed", "created_at", "timestamp"):
+        dt = _parse_ts(getattr(node, attr, None))
+        if dt is not None and (latest is None or dt > latest):
+            latest = dt
+    if latest is None:
+        return 0.0
+    return max(0.0, (now - latest).total_seconds() / 86400.0)
+
+
 def _access_age_days(node, now_ts=None):
     """距上次访问天数；无访问记录时返回 0（此时 access_count=0，热度项本就为 0，结果一致）。"""
     if not node.last_accessed:
@@ -236,7 +259,7 @@ def compute_weight(node, edge_count=0, now_ts=None):
     causal_factor = min(1 + config.CAUSAL_FACTOR_RATE * math.log1p(max(edge_count, 0)),
                         config.CAUSAL_FACTOR_MAX)
     status_mod = config.STATUS_MOD.get(node.status, 1.0)
-    age = _age_days(node, now_ts)
+    age = _last_active_days(node, now_ts)
     newness = config.NEWNESS_BOOST if age <= config.NEWNESS_BOOST_DAYS else 1.0
     w = config.W0 * math.exp(-lam * age) * causal_factor * status_mod * newness
     return min(1.0, max(floor, w))
@@ -272,6 +295,32 @@ def transition_allowed(old, new):
 
 
 # ============================= 图存储 GraphStore =============================
+
+def _load_tags(raw):
+    """[FIX 2026-11-13 P1-11] tags 反序列化防双重转义。
+
+    早期写入把已经序列化过的字符串又 json.dumps 了一次，落库成 '"[\\"supermem\\"]"'
+    这样的字符串；读出来后再按字符拆，于是 tag_frequency 里出现 '"' 462 次、',' 148 次、
+    空格 142 次这种"标签"。这里做幂等归一：最多解两层，非 list/str 一律丢弃。"""
+    v = raw
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, str) and x.strip()]
+    for _ in range(2):
+        if not isinstance(v, str):
+            break
+        s = v.strip()
+        if not s:
+            return []
+        try:
+            v = json.loads(s)
+        except Exception:
+            return [s]
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, str) and x.strip()]
+    if isinstance(v, str):
+        return [v.strip()] if v.strip() else []
+    return []
+
 
 class GraphStore:
     def __init__(self, db_path=None):
@@ -403,6 +452,11 @@ class GraphStore:
     # ---------- nodes ----------
     def add_node(self, node, dedup=True):
         """新增节点。dedup=True 时做内容前 60 字符 + 完全重复双查（INSERT OR IGNORE）。"""
+        # [FIX 2026-11-13 P1-11] 写入端 tags 幂等归一：传进来是字符串（可能已序列化过）
+        # 就按列表解析，避免落库时二次转义出新一批 '"[...]"' 脏数据。
+        if not isinstance(node.tags, (list, tuple)):
+            node.tags = _load_tags(node.tags)
+        node.tags = [str(t).strip() for t in node.tags if str(t).strip()]
         with self._lock:
             if dedup:
                 dup = self.conn.execute(
@@ -476,7 +530,7 @@ class GraphStore:
     def _row_to_node(self, row):
         node = Node(id=row["id"], content=row["content"], node_type=row["node_type"],
                     status=row["status"], timestamp=row["timestamp"], weight=row["weight"],
-                    project=row["project"], tags=json.loads(row["tags"] or "[]"),
+                    project=row["project"], tags=_load_tags(row["tags"]),
                     source=row["source"], confidence=row["confidence"], created_at=row["created_at"],
                     last_accessed=row["last_accessed"], access_count=row["access_count"],
                     version_of=row["version_of"], replaced_by=row["replaced_by"],
@@ -507,11 +561,25 @@ class GraphStore:
         with self._lock:
             if fields is None:
                 fields = allowed
+            else:
+                fields = set(fields)
+            # [FIX 2026-11-13] status 变更必须同步重算 grade：set_status / mark_permanent /
+            # mark_outdated / merge_into / archive_nodes 都只写 status，grade 停在旧值。
+            # 全库一致性审计（2276 条）实测 6 条不一致：merged 仍是 experience（应 hint）、
+            # permanent 仍是 hint（应 experience）。这里统一兜住，避免每个调用点各自补。
+            if "status" in fields and "grade" not in fields:
+                node.grade = compute_grade(node)
+                fields.add("grade")
             sets, args = [], []
             for f in (fields & allowed):
                 val = getattr(node, f)
                 if f == "tags":
-                    val = json.dumps(val, ensure_ascii=False)
+                    # [FIX 2026-11-13 P1-11] 写入前统一归一：外部传进来的 tags 可能是
+                    # 已被二次编码的字符串，直接 json.dumps 会再套一层引号（越写越脏）。
+                    if not isinstance(val, (list, tuple)):
+                        val = _load_tags(val)
+                    val = json.dumps([str(t).strip() for t in val if str(t).strip()],
+                                     ensure_ascii=False)
                 sets.append(f"{f}=?")
                 args.append(val)
             if not sets:
@@ -521,12 +589,26 @@ class GraphStore:
             self.conn.commit()
 
     def touch(self, nid):
-        """访问计数 +1（用于遗忘曲线 causal_factor 与检索）"""
+        """访问计数 +1（用于遗忘曲线 causal_factor 与检索）。
+
+        [FIX 2026-11-13 P1-5] 访问后重算 grade：原实现 compute_grade 只在 add_node
+        里算过一次，touch 不重算 → 一条线索被反复命中、access_count 早就够了，
+        grade 仍停在 hint（实测库内有 20 条 decision/insight/goal 错级）。
+        重算放在锁外（get_node/update_node 自带锁），不影响写入串行性。"""
         with self._lock:
             self.conn.execute(
                 "UPDATE nodes SET access_count=access_count+1, last_accessed=? WHERE id=?",
                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), nid))
             self.conn.commit()
+        node = self.get_node(nid)
+        if node is not None:
+            try:
+                g = compute_grade(node)
+            except Exception:
+                return
+            if g != (node.grade or ""):
+                node.grade = g
+                self.update_node(node, {"grade"})
 
     def set_status(self, nid, new_status):
         node = self.get_node(nid)
@@ -538,15 +620,17 @@ class GraphStore:
 
     # ---------- edges ----------
     def add_edge(self, edge, dedup=True):
+        """[FIX 2026-11-13 P2-20] 去重 SELECT 移入锁内：原实现先在锁外查重、再在锁内 INSERT，
+        两个并发写入同一 (from,to,type) 时都能通过查重，落成重复边（实测 4 组）。"""
         if edge.from_id == edge.to_id:
             return None, False  # [FIX] 自环检测
-        if dedup:
-            dup = self.conn.execute(
-                "SELECT id FROM edges WHERE from_id=? AND to_id=? AND edge_type=?",
-                (edge.from_id, edge.to_id, edge.edge_type)).fetchone()
-            if dup:
-                return dup["id"], False
         with self._lock:
+            if dedup:
+                dup = self.conn.execute(
+                    "SELECT id FROM edges WHERE from_id=? AND to_id=? AND edge_type=?",
+                    (edge.from_id, edge.to_id, edge.edge_type)).fetchone()
+                if dup:
+                    return dup["id"], False
             self.conn.execute("""INSERT OR IGNORE INTO edges
                 (id,from_id,to_id,edge_type,confidence,source,description,strength)
                 VALUES (?,?,?,?,?,?,?,?)""",
@@ -599,6 +683,11 @@ class GraphStore:
         archived = []
         for r in rows:
             node = self._row_to_node(r)
+            # [FIX 2026-11-13] 已退出检索的节点（obsolete / merged）不再参与本轮归档统计。
+            # 原实现把它们一起算进来，导致每次 /decay 都重复报"归档 N 条"，而 N 条早已不在
+            # 索引里，调用方看到的 archived_count 和实际变化对不上。
+            if node.status in ("obsolete", "merged"):
+                continue
             ec = self.edge_count_of(node.id)
             w = compute_weight(node, ec, now_ts)
             if w != node.weight:
@@ -610,17 +699,31 @@ class GraphStore:
         return archived
 
     def archive_nodes(self, node_ids):
-        """归档：节点 JSON 导出到 archive/（保留原记录，仅标记 + 退出活跃检索由调用方处理）"""
+        """归档：节点原记录导出到 archive/ + 真正退出活跃检索。
+
+        [FIX 2026-11-13 P0-1] 原实现只在 JSONL 里写一行就返回，既不标 status、也不删向量，
+        调用方无从得知哪些真归档了——整条"衰减→归档→删向量"链路是死代码。
+        现在：① 导出原记录（可追溯、可回滚）；② status → obsolete（语义就是"沉睡退出检索"，
+        不新增状态，避免与 STATUSES / 检索过滤 / verify_index 的排除集脱节）；
+        ③ 返回真正归档的 id，由调用方删向量（VectorSearch 不在 GraphStore 手里）。"""
         exported = []
+        if not node_ids:
+            return exported
         os.makedirs(config.ARCHIVE_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d")
         out = os.path.join(config.ARCHIVE_DIR, f"archive_{stamp}.jsonl")
         with open(out, "a", encoding="utf-8") as f:
             for nid in node_ids:
                 node = self.get_node(nid)
-                if node:
-                    f.write(json.dumps(node.to_dict(), ensure_ascii=False) + "\n")
-                    exported.append(nid)
+                if node is None:
+                    continue
+                f.write(json.dumps(node.to_dict(), ensure_ascii=False) + "\n")
+                # merged 是"并入他节点"的终态，保留原状态才能追 version 链；
+                # 只有仍在库内活跃的才算这次变 obsolete。
+                if node.status not in ("obsolete", "merged"):
+                    node.status = "obsolete"
+                    self.update_node(node, {"status"})
+                exported.append(nid)
         return exported
 
     # ---------- 时间旅行 ----------
@@ -645,6 +748,15 @@ class GraphStore:
             "SELECT status, COUNT(*) c FROM nodes GROUP BY status").fetchall()}
         return {"nodes": n, "edges": e, "episodes": ep, "by_status": by_status}
 
+    def indexable_node_count(self):
+        """[FIX 2026-11-13 P1-6] 可索引节点数（与 rebuild_vector_index 同一口径）。
+
+        向量对账原来用 nodes - vector_indexed，但可索引集合本身要排除
+        obsolete / merged，于是 /rebuild 之后缺口永远归不了零（实测 3→7）。"""
+        return self.conn.execute(
+            "SELECT COUNT(*) c FROM nodes WHERE status NOT IN ('obsolete','merged')"
+        ).fetchone()["c"]
+
     def dangling_edges(self):
         """悬空边（端点不存在）"""
         rows = self.conn.execute("""
@@ -657,6 +769,34 @@ class GraphStore:
     def self_loops(self):
         rows = self.conn.execute("SELECT id FROM edges WHERE from_id=to_id").fetchall()
         return [r["id"] for r in rows]
+
+    def duplicate_edges(self):
+        """[FIX 2026-11-13 P2-17] 重复边（同 from/to/type 多条）。
+
+        原来没有这个方法，selfcheck 也就从不检查重复边——实测库里有 4 组重复边
+        一直没人治理，而 add_edge 的锁内去重只对新写入生效。"""
+        rows = self.conn.execute("""
+            SELECT from_id, to_id, edge_type, COUNT(*) AS c
+            FROM edges GROUP BY from_id, to_id, edge_type HAVING c > 1""").fetchall()
+        return [{"from_id": r["from_id"], "to_id": r["to_id"],
+                 "edge_type": r["edge_type"], "count": r["c"]} for r in rows]
+
+    def dedup_edges(self):
+        """删除重复边：同 (from_id, to_id, edge_type) 只保留 id 最小的一条。返回删除条数。"""
+        removed = 0
+        dup = self.duplicate_edges()
+        if not dup:
+            return 0
+        with self._lock:
+            for d in dup:
+                ids = [r["id"] for r in self.conn.execute(
+                    "SELECT id FROM edges WHERE from_id=? AND to_id=? AND edge_type=? ORDER BY id",
+                    (d["from_id"], d["to_id"], d["edge_type"])).fetchall()]
+                for eid in ids[1:]:
+                    self.conn.execute("DELETE FROM edges WHERE id=?", (eid,))
+                    removed += 1
+            self.conn.commit()
+        return removed
 
     def isolated_nodes(self, min_edges=0):
         """孤岛节点（边数 <= min_edges）"""
@@ -773,7 +913,10 @@ class VectorSearch:
     # ---------- [FIX] 对账：修复双写一致性 ----------
     def verify_index(self, graph):
         """对比 SQLite 活跃节点与 ChromaDB 向量：返回缺向量 / 多向量两类孤儿。"""
-        db_ids = {n.id for n in graph.list_nodes(limit=100000) if n.status != "obsolete"}
+        # [FIX 2026-11-13 P1-6] 排除集与 rebuild_vector_index.py 对齐：obsolete + merged。
+        # 原来只排除 obsolete，merged 节点的残留向量被当成"该有"的，缺口永远算不平。
+        db_ids = {n.id for n in graph.list_nodes(limit=100000)
+                  if n.status not in ("obsolete", "merged")}
         col_ids = set(self._collection().get()["ids"]) if self.count() else set()
         missing = db_ids - col_ids   # 有节点无向量 → 需补写
         extra = col_ids - db_ids     # 有向量无节点 → 需清理

@@ -59,11 +59,16 @@ def auto_link(ms, node_id, content, project="default", k=None, min_score=None):
                 continue
             mid_linked += 1
         # ① 新 → 老
+        # [FIX 2026-11-13 P0-2] strength 落语义分：原来只把分数写进 description 文本，
+        # Edge.strength 恒为默认 1.0 —— 检索侧任何"按强度过滤/按强度加权"都失效
+        # （抽 20 条 related 边 7 条完全无关，却和强关联边同等参与扩散）。
         ms.graph.add_edge(Edge(from_id=node_id, to_id=oid, edge_type="related",
-                               source="auto_link", description="语义关联 %.2f" % score))
+                               source="auto_link", strength=round(float(score), 4),
+                               description="语义关联 %.2f" % score))
         # ② 老 → 新（双向：复用同一次 query 结果；dedup 幂等）
         ms.graph.add_edge(Edge(from_id=oid, to_id=node_id, edge_type="related",
-                               source="auto_link", description="语义关联 %.2f" % score))
+                               source="auto_link", strength=round(float(score), 4),
+                               description="语义关联 %.2f" % score))
         existing_out.add(oid)
         linked += 1
         if linked >= k:

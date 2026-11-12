@@ -65,4 +65,10 @@ def merge_into(ms, nid, target_id):
     ms.graph.add_edge(Edge(from_id=nid, to_id=target_id, edge_type="merged_into",
                            source="selfcheck", description="重复合并留痕"))
     ms.graph.update_node(node, {"status"})
+    # [FIX 2026-11-13 P1-12] 已合并节点不该再参与向量召回；API 的 /mark 分支已删，
+    # selfcheck 走的是本函数，之前漏删 → merged 节点继续被检索出来，且 gap 一直不收敛。
+    try:
+        ms.vector.delete(nid)
+    except Exception:
+        pass
     return True

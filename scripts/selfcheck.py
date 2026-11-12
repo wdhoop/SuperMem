@@ -28,19 +28,25 @@ def run_selfcheck(ms, dry_run=False):
     report["stats"] = s
     log.append(f"总览 nodes={s['nodes']} edges={s['edges']} episodes={s['episodes']}")
 
-    # 2. 悬空边 / 自环
+    # 2. 悬空边 / 自环 / 重复边
     dangling = ms.graph.dangling_edges()
     loops = ms.graph.self_loops()
+    dup_edges = ms.graph.duplicate_edges()
     if not dry_run:
         removed = clean_dangling_edges(ms)
         for eid in loops:
             ms.graph.delete_edge(eid)
+        removed += len(loops)
+        # [FIX 2026-11-13 P2-17] 原 selfcheck 从不处理重复边（同 from/to/type 多条），
+        # 实测库里 4 组重复边一直留着；实跑统计也没把自环清理计入 removed_edges。
+        removed += ms.graph.dedup_edges()
     else:
-        removed = len(dangling) + len(loops)
+        removed = len(dangling) + len(loops) + sum(d["count"] - 1 for d in dup_edges)
     report["dangling_edges"] = len(dangling)
     report["self_loops"] = len(loops)
+    report["duplicate_edges"] = len(dup_edges)
     report["removed_edges"] = removed if not dry_run else None
-    log.append(f"悬空边 {len(dangling)} / 自环 {len(loops)} / 清理 {removed}")
+    log.append(f"悬空边 {len(dangling)} / 自环 {len(loops)} / 重复边组 {len(dup_edges)} / 清理 {removed}")
 
     # 3. 孤岛
     isolated = ms.graph.isolated_nodes(min_edges=0)
@@ -95,6 +101,10 @@ def run_selfcheck(ms, dry_run=False):
         if n.status == "confirmed" and n.access_count == 0 and n.weight < 0.3:
             if not dry_run:
                 mark_obsolete(ms, n.id)
+                try:
+                    ms.vector.delete(n.id)   # [FIX 2026-11-13 P1-12] 退休节点同步退出向量索引
+                except Exception:
+                    pass
             dormant += 1
     # 7b. 决策反转：含反转关键词的 decision → 找同主题旧决策标 outdated + evolves_from
     decisions = [n for n in all_nodes if n.node_type == "decision"]
