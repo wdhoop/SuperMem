@@ -6,6 +6,9 @@
 """
 import os
 
+# ---- 版本号（/health 会回传，便于核对线上跑的是哪一版）----
+VERSION = "1.2.4"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 

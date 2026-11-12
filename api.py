@@ -95,7 +95,8 @@ class _Handler(BaseHTTPRequestHandler):
                 # obsolete/merged，与 rebuild_vector_index 一致）；原来用 nodes - vc，
                 # 这两个被排除的状态永远算作缺口，/rebuild 之后反而从 3 涨到 7 归不了零。
                 indexable = ms.graph.indexable_node_count()
-                return self._send(200, {"status": "ok", "nodes": s["nodes"], "edges": s["edges"],
+                return self._send(200, {"status": "ok", "version": config.VERSION,
+                                        "nodes": s["nodes"], "edges": s["edges"],
                                         "episodes": s["episodes"], "by_status": s["by_status"],
                                         "indexable_nodes": indexable,
                                         "vector_indexed": vc,

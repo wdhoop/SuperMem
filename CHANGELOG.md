@@ -65,6 +65,8 @@ python scripts/migrate_fix_20261113.py --db storage/super_memory.db --apply
 
 迁移后可感知变化：episodes 98→87（同起点重复聚合被合并）、related 边 strength 由全 1.0 变为均值 0.698（扩散过滤阈值 0.55 从此真正生效）。
 
+**同日实测补充（不修文过饰非）**：迁移完成后，当天 04:00 的定时 episode 聚合任务又补算了 **141 个新块**，episodes 由 87 变为 **228**（92 块为 2026 年、49 块为 2024 年 xiaoyao 评测语料）。这暴露一个不在 26 条范围内的问题：聚合粒度没有节点上限，最大一块塞进 **361 个节点**——一个"情景块"实际是一整段时间桶而不是一段场景。已列为待修项，计划加单块节点上限、超限按时间再切分并清理重算；本次不混进 1.2.4。
+
 ### 五、测试
 
 11 个套件 **178/178 全绿**（约 5 分钟）：模块 25 / HTTP 读 44 / HTTP 写 36 / HTTP 维护 7 / 维护扩展 9 / 缺陷冒烟 17 / 归档链 6 / 生命周期 6 / MCP 11 / CLI 桥接 10 / 重建锚点 7。
@@ -74,6 +76,15 @@ python scripts/migrate_fix_20261113.py --db storage/super_memory.db --apply
 - 交错延迟 p95 263ms → 415ms，均值 137ms → 150ms。
 - 并发：4 并发 p50 382 → 461ms（9.9 → 7.6 qps）；8 并发 563 → 793ms（12.4 → 8.7 qps）。
 - 当前归因为"关键词候选池 320→2000 导致 Python 层构造 Node 增多 + GIL 争用"，**尚未做单变量实验**，列为未闭环项。节点规模到 1 万时需要重设关键词召回策略（SQL 侧预打分 / 分批取 / 命中行数自适应）。
+
+### 七、版本号与 `/health`
+
+`config.py` 新增 `VERSION = "1.2.4"`，`GET /health` 返回体新增 `version` 字段。此前全仓没有任何版本常量，线上究竟跑的是哪一版只能靠翻 README 推断；现在一条 curl 就能核对：
+
+```bash
+curl -H "X-API-Token: $SUPERMEM_API_TOKEN" http://127.0.0.1:18766/health
+# {"status":"ok","version":"1.2.4","nodes":...,"vector_gap":0}
+```
 
 ### 改动文件
 

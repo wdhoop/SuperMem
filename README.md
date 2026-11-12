@@ -99,8 +99,8 @@ curl -X POST http://127.0.0.1:18766/extract \
 # 融合检索（图检索 + 向量 + 原文层强召回）
 curl "http://127.0.0.1:18766/search/strong/%E6%95%B0%E6%8D%AE%E5%BA%93%E8%BF%81%E7%A7%BB%20%E9%A3%8E%E9%99%A9?limit=10"
 
-# 健康检查
-curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN"
+# 健康检查（响应里的 version 即当前运行的版本，vector_gap 应为 0）
+curl http://127.0.0.1:18766/health -H "X-API-Token: $SUPERMEM_API_TOKEN"
 ```
 
 更多端点：`GET /search/<query>`（普通检索）、`GET /nodes?q=`（节点搜索/列表）、`GET /rewind/<ts>/<query>`（时间旅行）、`GET /timeline/<start>/<end>`（时间线）、`POST /mark`（状态流转）、`POST /decay`（权重衰减）、`POST /selfcheck`（健康自检）、`POST /rebuild`（重建向量索引）、`POST /backup`（备份）。
@@ -183,7 +183,7 @@ python scripts/migrate_fix_20261113.py --db storage/super_memory.db --dry-run   
 python scripts/migrate_fix_20261113.py --db storage/super_memory.db --apply     # 实际执行
 ```
 
-4. 起服务，`GET /health` 确认 `gap == 0`，再跑一次 `python scripts/selfcheck.py`。
+4. 起服务，`GET /health` 应返回 `"version": "1.2.4"` 且 `vector_gap == 0`（version 不一致说明覆盖的代码不对，gap 不为 0 说明向量索引没跟上），再跑一次 `python scripts/selfcheck.py`。
 
 迁移会动到的数据：标签清洗、边类型归一、重复边删除、related 边 strength 回填、节点时间戳归一、grade 重算、episode 引用修复与同起点 episode 合并。**第二次执行应全部为 0**——若不为 0，说明脚本没覆盖干净，先别继续。
 
