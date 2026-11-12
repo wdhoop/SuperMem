@@ -21,6 +21,9 @@ SuperMem 把"记忆"当作一等公民：写入时自动提取实体/事件/规�
   - **向量层**：ChromaDB + BGE embedding，cosine 相似度检索，支持本地模型目录。
   - **原文层（verbatim）**：写入内容逐字落库，带独立向量索引，供"强召回下探"——当图检索置信不足时自动下探原文，实测对 LoCoMo 难题组带来稳定 +25~28% 增益。
 - **融合检索 `search_strong`**：图检索 + 向量检索 + 原文下探 + 时间窗过滤 + 因果链扩展，一次调用返回结构化上下文。
+- **经验转正与检索拒答（v1.1.4）**：节点级 `grade` 只分 `experience`（可当结论用）/ `hint`（只能是线索），靠类型、置信度、被命中次数、时效四道条件转正；检索结论再分四档 `answer` / `record`（一手记录，作答时标明"这是记录不是结论"）/ `hint` / `no_match`，并附原因码（`margin_flat` / `top1_not_evidence` / `no_lexical_or_anchor_support` 等）。解决"该答的说没有、不该答的硬答"。
+- **实体锚定检索（v1.1.4，新增模块 `anchors.py`）**：写入时把实体词抽进锚点表（私有词 / 高 df 泛词 / 口语虚词三道闸门），检索时先查表、命中并入融合分（RRF 权重 0.55 + 绑定强度加成 0.03），补"字面不通、语义也漂"的那一路召回；命中回写 `hits`、四级排序淘汰、表满一次删到 95% 留缓冲。
+- **关键词路 SQL 化（v1.1.4）**：`_fts_recall` 从"Python 全表遍历逐条比对"改为 SQL 层 `instr` 先筛命中行、只对命中集算分，结果逐项一致，生产库 4.6× / 万节点库 4.7×。
 - **语义关联建边修复（v1.1.2）**：修复 related 边"漏建 + 不召回"双缺陷——写入时双向建边（新→老同时补老→新）+ k 2→8 阈值分层（强关联全建、弱关联限量）+ 检索沿 related 边扩散一跳（top 20 截断并入 RRF）+ 历史漏边一次性 backfill 脚本（幂等、可 `--dry-run` 预演）。
 - **注意力倾斜（v1.1.1，默认开启）**：检索全量召回后按当前状态向量重排——活跃目标自动感知（active goal 沿边扩散加权）+ importance 倾斜（goal_related ×1.15 / reference ×0.9）；**只改排序不删内容**，无活跃 goal 时零影响，一键 `TILT_ENABLED=False` 对照旧基线。
 - **写入回执验证（v1.1.1）**：写入后按原文读回，`saved` 是唯一判定依据；读不回自动重写一次，二次不回才如实报未存住（不假装成功）。
@@ -107,10 +110,11 @@ curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN
 写入链路：extract → rule_extractor / event_normalizer → core(Node) → add_node_with_vector
           → linker(auto_link 建边) → verbatim 原文落库 → memory_updater / cross_session
 
-检索链路：search_strong(融合) = 图检索 + 向量检索
+检索链路：search_strong(融合) = 图检索 + 向量检索 + 实体锚点
           →（可选 v1.0.1）联想检索 expand：无思考模式 LLM 生成联想句扩展召回
           → 置信不足时下探原文层（verbatim 强召回）
           → 时间窗过滤 + 因果链扩展 → 权重分区排序输出
+          →（v1.1.4）判据分级：answer / record / hint / no_match，附原因码
 
 生命周期：node_lifecycle / edge_lifecycle（状态机、衰减、遗忘）
           + priority_queue（回收队列）+ scheduler（定时任务）
@@ -118,8 +122,9 @@ curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN
           + metrics（统计）+ cycle_detector（循环检测）
 ```
 
-- `core.py`：图存储（GraphStore）、向量检索（VectorSearch）、因果引擎（CausalEngine）、记忆系统（MemorySystem）
-- `search_fusion.py`：融合检索主入口
+- `core.py`：图存储（GraphStore）、向量检索（VectorSearch）、因果引擎（CausalEngine）、记忆系统（MemorySystem）、经验转正判定（`compute_grade`）
+- `search_fusion.py`：融合检索主入口、拒答判据（`judge_verdict`）
+- `anchors.py`：实体锚点表——写入抽词建表、检索查表并入融合分
 - `api.py` / `main.py`：REST 服务与启动入口
 - `scheduler.py`：后台定时任务（回收、备份、清理）
 - `mcp_server.py`：MCP 协议服务（可选）
@@ -169,7 +174,8 @@ curl http://127.0.0.1:18766/health -H "Authorization: Bearer $SUPERMEM_API_TOKEN
 ```
 SuperMem/
 ├── core.py / api.py / main.py / config.py   # 核心 + 服务 + 入口 + 配置
-├── search_fusion.py / linker.py / extract.py
+├── search_fusion.py / anchors.py             # 融合检索 + 实体锚点表
+├── linker.py / extract.py
 ├── rule_extractor.py / event_normalizer.py / memory_updater.py
 ├── node_lifecycle.py / edge_lifecycle.py / cycle_detector.py
 ├── time_window.py / cross_session.py / priority_queue.py

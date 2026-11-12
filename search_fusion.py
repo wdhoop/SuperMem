@@ -22,7 +22,8 @@ import urllib.error
 from datetime import datetime
 
 import config
-from core import MemorySystem
+import anchors  # [UPD 2026-11-12] 实体钩子层
+from core import MemorySystem, skill_candidate
 
 # 联想句生成 prompt（评测四角度精简版；无思考模式模型，输出 JSON 数组）
 _ASSOC_PROMPT = (
@@ -123,16 +124,45 @@ def _tokenize(q):
     return toks, ql
 
 
-def _fts_recall(ms, q, project=None, top_k=config.RECALL_TOP_K):
-    """关键词路：字面命中 content/tags（SQL LIKE 等价的内存实现，中英文通用）。"""
+def _node_turn(node):
+    """从 tags 里读回 turn 序号（0 基，与适配器 ingest 的 idx 一致）。无标签返回 None。"""
+    for t in (getattr(node, "tags", None) or []):
+        if isinstance(t, str) and t.startswith("turn:"):
+            try:
+                return int(t[5:])
+            except ValueError:
+                return None
+    return None
+
+
+def _fts_recall(ms, q, project=None, top_k=config.RECALL_TOP_K, max_turn=None):
+    """关键词路：字面命中 content/tags（中英文通用）。
+    max_turn：只召回 turn 序号 < max_turn 的节点（评测回放用，模拟"库里只有 cutoff 前的历史"）。
+
+    [UPD 2026-11-13] 从"拉全表到 Python 逐条比对"改为"SQL 层先筛命中行，再在命中集里算分"：
+    原实现 list_nodes(limit=100000) 会把每行都转成 Node 对象（1 万节点时 10 万个对象字段），
+    耗时随节点数近线性。现由 SQLite C 层做字符串扫描，只把真正命中的行转对象。
+    两库实测结果集与分数完全一致，1 万节点 115ms → 24ms。"""
     toks, ql = _tokenize(q)
     if not toks:
         return []
-    nodes = ms.graph.list_nodes(project=project, limit=100000)
+    conds, args = [], []
+    for t in toks:
+        conds.append("(instr(lower(content), ?) > 0 OR instr(lower(tags), ?) > 0)")
+        args.extend([t, t])
+    sql = "SELECT * FROM nodes WHERE status != 'obsolete'"
+    if project:
+        sql += " AND project=?"
+        args.append(project)
+    sql += " AND (" + " OR ".join(conds) + ") ORDER BY timestamp DESC"
+    rows = ms.graph.conn.execute(sql, args).fetchall()
     hits = []
-    for node in nodes:
-        if node.status == "obsolete":
-            continue
+    for r in rows:
+        node = ms.graph._row_to_node(r)
+        if max_turn is not None:
+            tt = _node_turn(node)
+            if tt is None or tt >= max_turn:
+                continue
         cl = (node.content or "").lower()
         tl = " ".join(node.tags or []).lower()
         if ql in cl or ql in tl:
@@ -162,8 +192,10 @@ def _time_bonus(node):
 
 
 def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_queries=None,
-                      recency=0, scene=None, goal=0, state=None, tilt=False):
+                      recency=0, scene=None, goal=0, state=None, tilt=False, max_turn=None):
     """并行三路召回 + RRF 融合 + 时间加成，返回候选（已按融合分排序）。
+    max_turn：评测回放用——只让 turn 序号 < max_turn 的节点进候选池，等价于"库里当时
+    只有 cutoff 之前的历史"。不传时行为与旧版完全一致。
     assoc_queries: 联想句列表（可选）——每条联想句额外参与 vector/fts 召回并合并 RRF，
     扩大跨时间/跨粒度的召回面（评测回写，默认 None 时行为与旧版完全一致）。
     recency: [UPD 2026-10-20 时间维] 0=默认（时间仅小幅加成）；1=时间加权模式——
@@ -185,29 +217,44 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
     默认 False 时行为与旧版完全一致。"""
     cands = {}
 
+    def allow(node):
+        """max_turn 时只允许"带 turn 标签且序号 < max_turn"的节点进候选池。
+        无 turn 标签的节点（scheduler 自动抽取的二手记忆）一律排除——增量灌库的
+        真实状态里并不存在它们，混进来会污染回放对照。"""
+        if max_turn is None:
+            return True
+        tt = _node_turn(node)
+        return tt is not None and tt < max_turn
+
     def ensure(nid, node):
         if nid not in cands:
             cands[nid] = {"node": node, "vector_score": 0.0, "fts_score": 0.0,
                           "causal": 0, "related": 0, "assoc": 0, "scene": 0, "goal": 0,
-                          "goal_block": 0, "state": 0, "rrf": 0.0, "time_bonus": 1.0,
+                          "goal_block": 0, "state": 0, "anchor": 0, "rrf": 0.0, "time_bonus": 1.0,
                           "recall_score": 0.0}
         return cands[nid]
 
     # ① vector 向量路
     where = {"project": project} if project else None
-    vec_hits = ms.vector.query(q, top_k=config.RECALL_TOP_K, where=where)
+    # max_turn 时多取几倍候选，剔除 cutoff 之后的轮次后再补足 RECALL_TOP_K
+    vec_pool = config.RECALL_TOP_K * 4 if max_turn is not None else config.RECALL_TOP_K
+    vec_hits = ms.vector.query(q, top_k=vec_pool, where=where)
     vec_rank = 0
+    vec_in = []
     for hit in vec_hits:
         node = ms.graph.get_node(hit["id"])
-        if not node or node.status == "obsolete":
+        if not node or node.status == "obsolete" or not allow(node):
             continue
+        if vec_rank >= config.RECALL_TOP_K:
+            break
         vec_rank += 1
+        vec_in.append(hit)
         rec = ensure(hit["id"], node)
         rec["vector_score"] = hit["score"]
         rec["rrf"] += 1.0 / (60.0 + vec_rank)
 
     # ② fts 关键词路（字面命中）
-    fts_hits = _fts_recall(ms, q, project=project, top_k=config.RECALL_TOP_K)
+    fts_hits = _fts_recall(ms, q, project=project, top_k=config.RECALL_TOP_K, max_turn=max_turn)
     fts_rank = 0
     for node, fs in fts_hits:
         fts_rank += 1
@@ -240,7 +287,7 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
     # ③ causal 因果路：从 vector/fts 各自 top 10 种子沿因果边扩散 1 层
     seen_seed = set()
     causal_seeds = []
-    for hit in vec_hits[:10]:
+    for hit in vec_in[:10]:
         if hit["id"] not in seen_seed:
             seen_seed.add(hit["id"])
             causal_seeds.append(hit["id"])
@@ -253,7 +300,7 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
         for nbr in (ms.causal.get_causes(nid, depth=1, max_nodes=6) +
                     ms.causal.get_effects(nid, depth=1, max_nodes=6)):
             nn = ms.graph.get_node(nbr["id"])
-            if not nn or nn.status == "obsolete":
+            if not nn or nn.status == "obsolete" or not allow(nn):
                 continue
             causal_rank += 1
             rec = ensure(nn.id, nn)
@@ -271,7 +318,7 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
                 if e.edge_type != "related":
                     continue
                 nn = ms.graph.get_node(e.to_id)
-                if not nn or nn.status == "obsolete":
+                if not nn or nn.status == "obsolete" or not allow(nn):
                     continue
                 related_rank += 1
                 rec = ensure(nn.id, nn)
@@ -285,7 +332,7 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
                 if e.edge_type != "related":
                     continue
                 nn = ms.graph.get_node(e.from_id)
-                if not nn or nn.status == "obsolete":
+                if not nn or nn.status == "obsolete" or not allow(nn):
                     continue
                 related_rank += 1
                 rec = ensure(nn.id, nn)
@@ -311,7 +358,7 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
                 if e.edge_type not in ("involves", "occurred_in"):
                     continue
                 nn = ms.graph.get_node(e.from_id)
-                if not nn or nn.status == "obsolete":
+                if not nn or nn.status == "obsolete" or not allow(nn):
                     continue
                 scene_rank += 1
                 rec = ensure(nn.id, nn)
@@ -332,7 +379,7 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
         for g in goal_nodes[:10]:
             for e in ms.graph.in_edges(g.id):
                 nn = ms.graph.get_node(e.from_id)
-                if not nn or nn.status == "obsolete":
+                if not nn or nn.status == "obsolete" or not allow(nn):
                     continue
                 if e.edge_type == "contributes_to":
                     goal_rank += 1
@@ -359,12 +406,31 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
                 if e.edge_type != "transitions_to":
                     continue
                 nn = ms.graph.get_node(e.from_id)
-                if not nn or nn.status == "obsolete":
+                if not nn or nn.status == "obsolete" or not allow(nn):
                     continue
                 state_rank += 1
                 rec = ensure(nn.id, nn)
                 rec["state"] = rec.get("state", 0) + 1
                 rec["rrf"] += config.STATE_SEARCH_WEIGHT * (1.0 / (60.0 + state_rank))
+
+    # ⑧ anchor 实体钩子路（[UPD 2026-11-12] 借鉴"下意识"机制）：query 里出现钩子词
+    #    → 直接带出写入时绑定该词的节点。运行时只做字符串切分 + 查表，不 embed、
+    #    不调模型、不遍历图；命中强度按"钩子覆盖率"折算，避免泛词淹没向量结果。
+    anchor_rank = 0
+    if getattr(config, "ANCHOR_ENABLED", False):
+        try:
+            hooks = anchors.hook_recall(ms, q, project=project)
+        except Exception:
+            hooks = []
+        for nid, hits, cov, strength in hooks:
+            nn = ms.graph.get_node(nid)
+            if not nn or nn.status == "obsolete" or not allow(nn):
+                continue
+            anchor_rank += 1
+            rec = ensure(nn.id, nn)
+            rec["anchor"] = hits
+            rec["anchor_strength"] = strength
+            rec["rrf"] += config.ANCHOR_SEARCH_WEIGHT * cov * (1.0 / (60.0 + anchor_rank))
 
     # 时间加成 + 最终融合分（RRF 分 * 新鲜度加权，最多上浮 40%）
     # [UPD 2026-10-20 时间维] recency=1 时：时间占比加大（0.4+0.6*time_bonus），
@@ -379,6 +445,10 @@ def recall_candidates(ms, q, project=None, top_k=config.RECALL_TOP_K, assoc_quer
         node = rec["node"]
         rec["time_bonus"] = _time_bonus(node)
         base = rec["rrf"]
+        if rec.get("anchor"):
+            # 钩子加成按"绑定强度"算：只在 tags 里蹭到的弱绑定几乎不加分，
+            # 标题位/专名节点的强绑定才给满额 —— 否则泛标签会把噪声顶到 top1
+            base += config.ANCHOR_BOOST * min(1.0, float(rec.get("anchor_strength", 0) or 0) / 4.0)
         if recency:
             in_window = 0.0
             try:
@@ -407,31 +477,104 @@ def rerank(ms, cands, top_n=config.SEARCH_LIMIT_DEFAULT):
     return cands[:top_n]
 
 
+def _evidence_kind(r):
+    """[UPD 2026-11-12] 一条命中的证据成色：experience / record / hint。
+
+    experience = 已转正的决策、规则、结论、坑——可以当依据说"就是这样"；
+    record     = 事件/状态/待办这类一手记录——可以答，但必须标明"这是一条记录，
+                 不是结论"（否则就是拿流水账冒充经验）；
+    hint       = 其余未转正内容——只能当线索，不能说成答案。
+    """
+    if r.get("evidence_level") == "experience":
+        return "experience"
+    nt = ((r.get("node") or {}).get("node_type") or "")
+    if nt in getattr(config, "GRADE_RECORD_TYPES", set()):
+        return "record"
+    return "hint"
+
+
+def judge_verdict(results):
+    """[UPD 2026-11-12] 检索端拒答判据：库里没有，就直说没有。
+
+    返回 (verdict, confidence, reason)：
+      answer   = 有明确最佳命中，且最佳命中是转正经验（可作依据）
+      record   = 最佳命中是一手记录（事件/状态/待办），排序明确但只能当记录答
+      hint     = 命中了但只能当线索（分数挤在一起 / 最佳命中是未转正内容）
+      no_match = 库内没有相关内容
+
+    判据依次收口：绝对地板 → 字面/锚定支撑 → 证据成色 → 相对间隔。
+    """
+    if not getattr(config, "VERDICT_ENABLED", False):
+        return "answer", 1.0, "verdict_disabled"
+    if not results:
+        return "no_match", 0.0, "no_results"
+    scores = [float(r.get("score", 0.0) or 0.0) for r in results]
+    top1 = scores[0]
+    top2 = scores[1] if len(scores) > 1 else 0.0
+    margin = (top1 / top2) if top2 > 1e-9 else 99.0
+    # [UPD 2026-11-12] 判据要求"最佳命中本身成色够"，不能拿 top3 里别处的经验
+    # 给一条 hint 级流水账背书——否则 top1 是事件记录、却对外声称"这是答案"，自相矛盾。
+    top1_kind = _evidence_kind(results[0])
+    if top1 < config.VERDICT_ABS_FLOOR:
+        return "no_match", round(min(1.0, top1 / config.VERDICT_ABS_FLOOR), 4), "below_floor"
+    conf = round(min(1.0, top1 / (config.VERDICT_ABS_FLOOR * 5.0)), 4)
+    # [UPD 2026-11-12] 纯向量猜测不算"库里有"：top5 里既无实体钩子命中、也无整串字面命中，
+    # 说明只是语义空间里"看着近"，库里其实没有这条内容 → 直接拒答，不给线索级答案。
+    support = any((r.get("anchor_hits") or 0) > 0 or r.get("lexical_hit") for r in results[:5])
+    if not support:
+        return "no_match", conf, "no_lexical_or_anchor_support"
+    if config.VERDICT_EVIDENCE_REQUIRED and top1_kind != "experience":
+        # 记录档：top1 是一手记录，且排序明确 → 可以答，但标记为记录
+        if top1_kind == "record" and margin >= config.VERDICT_MARGIN_MIN:
+            return "record", conf, "record_only"
+        if top1_kind == "record":
+            return "hint", conf, "margin_flat"
+        return "hint", conf, "top1_not_evidence"
+    if margin < config.VERDICT_MARGIN_MIN:
+        return "hint", conf, "margin_flat"
+    return "answer", conf, "ok"
+
+
 def search(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, with_causal=True,
-           recency=0, scene=None, goal=0, state=None, tilt=False):
+           recency=0, scene=None, goal=0, state=None, tilt=False, touch=True, max_turn=None):
     """完整检索：三路召回 → RRF 融合 → 时间加成 → 因果链（causes/effects 各取 3 层）。
     recency=1：时间加权模式；scene=：场景过滤检索；goal=1：目标导向重排；
     state=：状态检索；tilt=True：注意力倾斜（活跃目标自动感知 + importance 倾斜，
-    只改排序不删内容，见 recall_candidates）。"""
+    只改排序不删内容，见 recall_candidates）。
+    touch=False：只读检索（不累加 access_count），用于评测回放 / A-B / 事后复盘。
+    max_turn=N：只检索 turn 序号 < N 的历史（评测回放专用，等价于增量灌库时的可见范围）。"""
     cands = recall_candidates(ms, q, project=project, recency=recency, scene=scene,
-                              goal=goal, state=state, tilt=tilt)
+                              goal=goal, state=state, tilt=tilt, max_turn=max_turn)
     top = rerank(ms, cands, top_n=limit)
     results = []
     for c in top:
         node = c["node"]
-        ms.graph.touch(node.id)  # 检索即访问，计入 causal_factor
+        if touch:
+            ms.graph.touch(node.id)  # 检索即访问，计入 causal_factor（只读模式下跳过）
         item = {"node": node.to_dict(), "score": round(c["recall_score"], 4),
                 "weight_zone": ("Core" if node.weight >= config.CORE_MIN else
                                 "Working" if node.weight >= config.WORKING_MIN else
-                                "Cold" if node.weight >= config.COLD_MIN else "Archive")}
+                                "Cold" if node.weight >= config.COLD_MIN else "Archive"),
+                # [UPD 2026-11-12] 这条能不能当依据：experience=可作依据 / record=一手记录 / hint=只能当线索
+                "evidence_level": getattr(node, "grade", None) or config.GRADE_DEFAULT,
+                "skill_candidate": skill_candidate(node),
+                "anchor_hits": int(c.get("anchor", 0) or 0),
+                # 字面/实体支撑：只有向量"看着像"不算证据（[UPD 2026-11-12] 拒答判据用）
+                "lexical_hit": float(c.get("fts_score", 0) or 0) >= config.VERDICT_LEXICAL_MIN,
+                "vector_sim": round(float(c.get("vector_score", 0) or 0), 4),
+                "fts_sim": round(float(c.get("fts_score", 0) or 0), 4)}
         if "tilt_boost" in c:
             item["tilt_boost"] = c["tilt_boost"]
         if with_causal:
             item["causes"] = ms.causal.get_causes(node.id)
             item["effects"] = ms.causal.get_effects(node.id)
+        item["evidence_kind"] = _evidence_kind(item)
         results.append(item)
-    return {"query": q, "limit": limit, "engine": "recall+rrf(V6,3路)",
-            "tilted": bool(tilt and config.TILT_ENABLED), "results": results}
+    verdict, conf, reason = judge_verdict(results)
+    return {"query": q, "limit": limit, "engine": "recall+rrf(V6,3路+anchor)",
+            "tilted": bool(tilt and config.TILT_ENABLED),
+            "verdict": verdict, "confidence": conf, "verdict_reason": reason,
+            "results": results}
 
 
 def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_raw=False,
@@ -459,11 +602,19 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
         item = {"node": node.to_dict(), "score": round(c["recall_score"], 4),
                 "weight_zone": ("Core" if node.weight >= config.CORE_MIN else
                                 "Working" if node.weight >= config.WORKING_MIN else
-                                "Cold" if node.weight >= config.COLD_MIN else "Archive")}
+                                "Cold" if node.weight >= config.COLD_MIN else "Archive"),
+                "evidence_level": getattr(node, "grade", None) or config.GRADE_DEFAULT,
+                "skill_candidate": skill_candidate(node),
+                "anchor_hits": int(c.get("anchor", 0) or 0),
+                # 字面/实体支撑：只有向量"看着像"不算证据（[UPD 2026-11-12] 拒答判据用）
+                "lexical_hit": float(c.get("fts_score", 0) or 0) >= config.VERDICT_LEXICAL_MIN,
+                "vector_sim": round(float(c.get("vector_score", 0) or 0), 4),
+                "fts_sim": round(float(c.get("fts_score", 0) or 0), 4)}
         if "tilt_boost" in c:
             item["tilt_boost"] = c["tilt_boost"]
         item["causes"] = ms.causal.get_causes(node.id)
         item["effects"] = ms.causal.get_effects(node.id)
+        item["evidence_kind"] = _evidence_kind(item)
         results.append(item)
 
     best_score = results[0]["score"] if results else 0.0
@@ -500,7 +651,12 @@ def search_strong(ms, q, limit=config.SEARCH_LIMIT_DEFAULT, project=None, force_
             mode = "none"
     if assoc_queries:
         mode = mode + "+assoc"
+    verdict, conf, reason = judge_verdict(results)
+    if verdict == "no_match" and raw:
+        # 原文层能逐字捞到东西，就不是"库里没有"，只是还没成经验
+        verdict, reason = "hint", "verbatim_only"
     return {"query": q, "mode": mode, "engine": "recall+rrf→verbatim(强召回,assoc可选)",
+            "verdict": verdict, "confidence": conf, "verdict_reason": reason,
             "results": results, "raw": raw, "assoc_queries": assoc_queries,
             "tilted": bool(tilt and config.TILT_ENABLED)}
 

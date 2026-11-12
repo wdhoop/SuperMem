@@ -26,7 +26,7 @@ class Node:
                  timestamp=None, weight=config.W0, project="default", tags=None,
                  source="", confidence=1.0, created_at=None, last_accessed=None,
                  access_count=0, version_of=None, replaced_by=None, marked_until=None,
-                 importance=None):
+                 importance=None, grade=None):
         self.id = id or f"{node_type}_{datetime.now().strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
         self.content = content
         self.node_type = node_type
@@ -45,16 +45,86 @@ class Node:
         self.marked_until = marked_until
         # [UPD 2026-10-20 价值维] importance 价值分级：goal_related / operational / reference
         self.importance = importance or ("reference" if node_type != "goal" else "goal_related")
+        # [UPD 2026-11-12 经验转正] grade：hint（线索，不可作依据）/ experience（合格经验，可作依据）
+        self.grade = grade or config.GRADE_DEFAULT
 
     def to_dict(self):
         return {k: getattr(self, k) for k in
                 ("id", "content", "node_type", "status", "timestamp", "weight", "project",
                  "tags", "source", "confidence", "created_at", "last_accessed",
-                 "access_count", "version_of", "replaced_by", "marked_until", "importance")}
+                 "access_count", "version_of", "replaced_by", "marked_until", "importance",
+                 "grade")}
 
     @classmethod
     def from_dict(cls, d):
         return cls(**{k: v for k, v in d.items() if k in cls.__init__.__code__.co_varnames})
+
+
+# ============ 经验转正判定（2026-11-12）============
+def _parse_dt(s):
+    """尽力解析时间串，失败返回 None。"""
+    if not s:
+        return None
+    s = str(s).strip().replace("T", " ")
+    if len(s) >= 19:
+        s = s[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def compute_grade(node, now=None):
+    """这条记忆能不能当答案的依据。
+    experience = 合格经验：类型够硬 + 置信度够 + 被反复用过 + 没过期 / 或状态已确认
+    hint       = 线索：只能说明"库里有这么一条"，不可直接当结论引用
+    """
+    if not getattr(config, "GRADE_ENABLED", False):
+        return "experience"
+    st = (getattr(node, "status", "") or "").lower()
+    if st in config.GRADE_RETIRE_STATUSES:
+        return "hint"
+    if st in config.GRADE_CERTAIN_STATUSES:
+        return "experience"
+    if (getattr(node, "node_type", "") or "") not in config.GRADE_EVIDENCE_TYPES:
+        return "hint"
+    # [UPD 2026-11-12] insight/fact/experiment/milestone 这类短笔记容易被闲聊污染：
+    # 实测转正后最短的一批是"你好吗？我很好。""今天天气不错。""缓存满了"（confidence 照样 1.0）。
+    # 这类不能当依据，按内容长度挡回 hint。
+    if (getattr(node, "node_type", "") or "") in config.GRADE_LEN_CHECK_TYPES:
+        txt = (getattr(node, "content", "") or "").strip()
+        if len(txt) < config.GRADE_MIN_CONTENT_LEN:
+            return "hint"
+    try:
+        conf = float(getattr(node, "confidence", 0) or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if conf < config.GRADE_EVIDENCE_MIN_CONF:
+        return "hint"
+    try:
+        acc = int(getattr(node, "access_count", 0) or 0)
+    except (TypeError, ValueError):
+        acc = 0
+    if acc < config.GRADE_EVIDENCE_MIN_ACCESS:
+        return "hint"
+    ref = _parse_dt(getattr(node, "last_accessed", None) or getattr(node, "created_at", None))
+    if ref is not None:
+        age = ((now or datetime.now()) - ref).days
+        if age > config.GRADE_EVIDENCE_MAX_AGE_DAYS:
+            return "hint"
+    return "experience"
+
+
+def skill_candidate(node):
+    """反复命中到一定次数的合格经验 → skill 候选（只打标，不自动生成经验卡）。"""
+    if compute_grade(node) != "experience":
+        return False
+    try:
+        return int(getattr(node, "access_count", 0) or 0) >= int(getattr(config, "GRADE_SKILL_ACCESS", 10**9))
+    except (TypeError, ValueError):
+        return False
 
 
 class Edge:
@@ -112,10 +182,9 @@ _TS_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
 
 def _parse_ts(value):
     """统一解析历史遗留的多格式时间戳（缺秒 / ISO / 带时区）。
-    [FIX 2026-11-07] 旧实现只认 "%Y-%m-%d %H:%M:%S"，而真实库里大量时间戳是
-    "2026-09-30 17:23"（缺秒）或 "2026-05-05T09:14:00+08:00"（ISO），解析失败后
-    被当成"刚刚创建"（age=0），衰减项恒为 1，这批记忆永不衰减。生产库实测
-    76.5%（1494/1953）节点踩此坑。解析失败一律返回 None，不再伪造 now。"""
+    [FIX 2026-11-07] 旧实现只认 "%Y-%m-%d %H:%M:%S"，而库内 76.5% 的时间戳是
+    "2026-09-30 17:23"（缺秒）这类格式，解析失败后被当成"刚刚创建"（age=0），
+    衰减项恒为 1，这批记忆永不衰减。解析失败一律返回 None，不再伪造 now。"""
     if not value:
         return None
     s = str(value).strip()
@@ -154,14 +223,13 @@ def _access_age_days(node, now_ts=None):
 
 
 def compute_weight(node, edge_count=0, now_ts=None):
-    """遗忘曲线：W(t) = min(1, max(floor, W0 * e^(-λ(t)) * causal_factor * status_mod * newness))
+    """遗忘曲线：W(t) = min(1, max(floor, W0 * e^(-λt) * causal_factor * status_mod * newness))
     [FIX 2026-11-07] 两处结构性修正：
-      1) 访问热度不再乘进权重。旧实现 heat=access_count*e^(-λ·天)，访问 51 次就能把
+      1) 访问热度不再乘进权重。旧实现 heat=access_count*e^(-λ·天)，51 次访问就能把
          causal_factor 顶到上限 2.0 —— 等于"用得越多越权威"，错误记忆靠被反复检索
-         自我强化、永不衰减（生产库实测 1036 个节点顶格 1.00）。访问量只保留在检索
-         排序的 access 分量，用于排序而不用于定性。
-      2) causal 上限由 2.0 降到 1.3，保证 0.7 * 1.3 = 0.91 < 1.0，权重不再全民顶格，
-         新旧条目重新有区分度；新写入的认知另有 7 天新近加成，让新结论先压过旧的。"""
+         自我强化、永不衰减。访问量只保留在检索排序的 access 分量。
+      2) causal 上限由 2.0 降到 1.3，保证 0.7 * 1.3 = 0.91 < 1.0，权重不再全部顶格，
+         新旧条目之间重新有区分度；新写入的认知另有 7 天新近加成。"""
     level = _level_of(node)
     lam = config.LAMBDA_BY_TYPE[level]
     floor = config.FLOOR_BY_TYPE[level]
@@ -237,7 +305,8 @@ class GraphStore:
                 version_of TEXT,
                 replaced_by TEXT,
                 marked_until TEXT,
-                importance TEXT NOT NULL DEFAULT 'reference'
+                importance TEXT NOT NULL DEFAULT 'reference',
+                grade TEXT NOT NULL DEFAULT 'hint'
             );
             CREATE TABLE IF NOT EXISTS edges(
                 id TEXT PRIMARY KEY,
@@ -290,6 +359,29 @@ class GraphStore:
                 if "importance" not in cols:
                     self.conn.execute("ALTER TABLE nodes ADD COLUMN importance TEXT NOT NULL DEFAULT 'reference'")
                     self.conn.commit()
+                # [UPD 2026-11-12 经验转正] 老库补 grade 列（幂等）
+                if "grade" not in cols:
+                    self.conn.execute("ALTER TABLE nodes ADD COLUMN grade TEXT NOT NULL DEFAULT 'hint'")
+                    self.conn.commit()
+            except Exception:
+                pass
+            # [UPD 2026-11-12 实体钩子层] 写入时建好的锚点路由表：词 → 节点
+            try:
+                self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS anchors(
+                    term TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    scene TEXT NOT NULL DEFAULT '',
+                    project TEXT NOT NULL DEFAULT 'default',
+                    hits INTEGER NOT NULL DEFAULT 0,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(term, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_anchors_term ON anchors(term);
+                CREATE INDEX IF NOT EXISTS idx_anchors_node ON anchors(node_id);
+                """)
+                self.conn.commit()
             except Exception:
                 pass
             # 初始化运维指标
@@ -318,15 +410,17 @@ class GraphStore:
                     (node.content, node.content)).fetchone()
                 if dup:
                     return dup["id"], False
+            node.grade = compute_grade(node)  # [2026-11-12] 写入即判定：新记忆默认只是线索
             self.conn.execute("""INSERT OR IGNORE INTO nodes
                 (id,content,node_type,status,timestamp,weight,project,tags,source,confidence,
-                 created_at,last_accessed,access_count,version_of,replaced_by,marked_until,importance)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 created_at,last_accessed,access_count,version_of,replaced_by,marked_until,importance,grade)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (node.id, node.content, node.node_type, node.status, node.timestamp, node.weight,
                  node.project, json.dumps(node.tags, ensure_ascii=False), node.source, node.confidence,
                  node.created_at, node.last_accessed, node.access_count,
                  node.version_of, node.replaced_by, node.marked_until,
-                 getattr(node, "importance", None) or "reference"))
+                 getattr(node, "importance", None) or "reference",
+                 getattr(node, "grade", None) or config.GRADE_DEFAULT))
             if self.conn.total_changes or True:
                 self.conn.commit()
             return node.id, True
@@ -387,7 +481,8 @@ class GraphStore:
                     last_accessed=row["last_accessed"], access_count=row["access_count"],
                     version_of=row["version_of"], replaced_by=row["replaced_by"],
                     marked_until=row["marked_until"],
-                    importance=row["importance"] if "importance" in row.keys() else None)
+                    importance=row["importance"] if "importance" in row.keys() else None,
+                    grade=row["grade"] if "grade" in row.keys() else None)
         return node
 
     def list_nodes(self, project=None, limit=100, status=None):
@@ -408,7 +503,7 @@ class GraphStore:
         """局部更新节点字段；fields 为要更新的字段名集合，缺省为全部。"""
         allowed = {"content", "node_type", "status", "timestamp", "weight", "project", "tags",
                    "source", "confidence", "last_accessed", "access_count", "version_of",
-                   "replaced_by", "marked_until"}
+                   "replaced_by", "marked_until", "grade"}
         with self._lock:
             if fields is None:
                 fields = allowed
@@ -830,6 +925,12 @@ class MemorySystem:
                 # 进重试队列，由 selfcheck/下次写时补偿
                 self._pending_vector_writes = getattr(self, "_pending_vector_writes", [])
                 self._pending_vector_writes.append(nid)
+            # [UPD 2026-11-12 实体钩子层] 写入即建路由：词 → 节点
+            try:
+                import anchors
+                anchors.index_node(self, node)
+            except Exception:
+                pass
         return nid, created
 
     def add_verbatim(self, text, ts=None, source="", node_id=None, session="", vid=None, with_vector=True):

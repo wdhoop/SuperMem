@@ -239,3 +239,87 @@ EDGE_TYPES = ["part_of", "derives_insight", "applies", "improves", "evolves_from
               "involves", "occurred_in",
               "contributes_to", "blocks",
               "transitions_to"]
+
+
+
+# =====================================================================
+# [UPD 2026-11-12] 三条改造（lab 实例全量验证通过，已合并生产）
+# ① 经验转正标记  ② 检索拒答  ③ 实体钩子层（anchor hook）
+# =====================================================================
+
+# ---- ① 经验转正标记：离散的"能否作为答案依据"开关 ----
+GRADE_ENABLED = True
+GRADE_EVIDENCE_TYPES = {"decision", "rule", "technique", "project", "goal",
+                        "insight", "fact", "experiment", "milestone"}
+# [UPD 2026-11-12] 补进 insight/fact/experiment/milestone：实测库里 insight 174 条里
+# 119 条已满足 conf>=0.8 且 access>=2，内容全是"结论：xxx""坑：xxx""根因：xxx"，
+# 是最典型的经验卡，之前被类型闸门整类挡在门外（experience 卡在 336）。
+# 仍然不给 event 发牌（1157 条流水账，给了就等于把事件记录冒充结论）；
+# task/state/todo 也不给（待办和状态天生是线索。
+GRADE_EVIDENCE_MIN_CONF = 0.80        # confidence 门槛
+GRADE_EVIDENCE_MIN_ACCESS = 2         # 被检索命中次数门槛
+GRADE_EVIDENCE_MAX_AGE_DAYS = 120     # 超过该天数未再被访问 → 退回线索
+GRADE_CERTAIN_STATUSES = {"confirmed", "permanent"}     # 直接视为合格经验
+GRADE_RETIRE_STATUSES = {"outdated", "obsolete", "disputed", "merged"}  # 强制降回线索
+GRADE_SKILL_ACCESS = 6                # 同一经验反复命中次数 ≥ 此值 → 打 skill_candidate 标记
+GRADE_DEFAULT = "hint"                # 缺省等级：未转正的只能当线索
+GRADE_RECORD_TYPES = {"event", "state", "todo", "task"}
+GRADE_LEN_CHECK_TYPES = {"insight", "fact", "experiment", "milestone"}
+GRADE_MIN_CONTENT_LEN = 12
+# [UPD 2026-11-12] 只有上面四类做长度检查：它们是"短笔记"形态，混着大量闲聊
+# （实测最短的是"你好吗？我很好。""今天天气不错。""缓存满了"，confidence 全 1.0）。
+# decision/rule 之类本身有内容规范，不额外卡长度。
+# [UPD 2026-11-12] "记录档"：事件/状态/待办这类节点不转正（不能冒充结论），
+# 但它们确实是一手记录，命中且排序明确时可以答，只是要标明"这是记录，不是结论"。
+# 这样既不给流水账发经验牌，也不会让 answer 变成死档。
+
+# ---- ② 检索拒答：库里没有就直说没有 ----
+VERDICT_ENABLED = True
+VERDICT_ABS_FLOOR = 0.02              # RRF 融合分绝对地板（低于此视为无有效命中）
+VERDICT_MARGIN_MIN = 1.10             # top1 / top2 分比低于此 → 结果聚集、无明确最佳
+                                      # [2026-11-13] 1.25→1.10：answer 硬条件是 top1 必须为经验节点，
+                                      # margin 只防"两条经验打平"；1.10 实测多放出 1 条真经验，
+                                      # 3 条无关 query 判定一条未变
+VERDICT_EVIDENCE_REQUIRED = True
+VERDICT_LEXICAL_MIN = 0.6             # 字面命中强度达到这个值才算"有支撑"（整串1.0 / 多token命中0.6+）      # answer 级结论必须至少有一条 evidence 级节点
+
+# ---- ③ 实体钩子层（anchor hook）：写入时建表，检索时查表 ----
+ANCHOR_ENABLED = True
+ANCHOR_SEARCH_WEIGHT = 0.55           # 钩子命中在 RRF 中的权重（锚定效应高于普通一路召回）
+ANCHOR_BOOST = 0.03                   # [UPD 2026-11-12] 钩子命中的定值加成：能进表的词已过 df 闸门，
+                                      # 但加成必须按"绑定强度"给（min(1, strength/4)），不能按命中词数给，
+                                      # 否则只在 tags 蹭到实体词的节点会被顶到 top1。0.02 实测会丢失
+                                      # 小妖/Strata 的 top1 换准效果，0.03 为当前最优。
+                                      # 命中即强信号；只靠 RRF 的 1/(60+rank) 压不过向量噪声。
+ANCHOR_MIN_TERM_LEN = 2               # 中文最小字数
+ANCHOR_MAX_TERM_LEN = 12              # 最长词条（防整句入表）
+ANCHOR_MAX_TERMS_PER_NODE = 12        # 单节点最多抽几个钩子
+ANCHOR_TOP_K = 20                     # 单次最多并入多少条钩子命中
+ANCHOR_MAX_TABLE = 20000              # 钩子表条目上限
+ANCHOR_CEIL_SLACK_RATIO = 0.05        # [2026-11-13] 超限时一次多删留缓冲（删到 95%），
+                                      # 避免每写一条就触发一次回收
+ANCHOR_MIN_HITS_KEEP = 1              # 命中次数低于此值的钩子可被回收
+ANCHOR_MAX_DF_LATIN = 200             # 拉丁字母/型号词的 df 上限（实体词天然高频，如 Hive、Strata）
+ANCHOR_MAX_DF_CN = 50                 # 中文词的 df 上限（中文高频几乎都是口语虚词，必须卡死）
+ANCHOR_MIN_DF = 2                     # 只被一个节点用到的词是私有词，不进路由表（准入闸门）
+ANCHOR_ENTITY_TYPES = {"person", "system", "item", "scene", "project", "work",
+                       "book", "concept"}  # 实体节点直接整条内容作为锚点词
+ANCHOR_STOPWORDS = {"这个", "那个", "我们", "你们", "他们", "什么", "怎么", "为什么",
+                    "可以", "已经", "一下", "一个", "现在", "然后", "但是", "因为",
+                    "所以", "如果", "就是", "还是", "没有", "不是", "这样", "那样",
+                    # 口语虚词/无检索价值的常用串（实测库内高频，会污染路由）
+                    "也是", "那就好", "服了", "真的", "好家伙", "不过", "话说回来",
+                    "那可不", "在呢", "嗯嗯", "哈哈哈", "呜呜", "救命", "反正", "其实",
+                    "感觉", "觉得", "知道", "时候", "事情", "东西", "意思", "可能",
+                    "应该", "需要", "一直", "有点", "特别", "比较", "非常", "确实",
+                    "是不是", "有没有", "对吧", "咋办", "啥的", "之类", "什么的",
+                    "这个时候", "那个时候", "我知道了", "明白了", "没关系", "没什么",
+                    "怎么了", "咋了", "行吧", "好吧", "算了", "随便", "慢慢", "先说",
+                    "听着", "说白了", "总之", "而且", "或者", "虽然", "除非", "既然",
+                    "于是", "接着", "同时", "另外", "此外", "这样的话", "怎么样",
+                    "是不是啊", "对啊", "是啊", "嗯哼", "哎哟", "我去", "我的天",
+                    # 内部元标签与无实体信息的泛词（实测库里高频，不构成"实体锚点"）
+                    "auto_extract", "llm_extract", "event", "turn", "bench", "bench22",
+                    "AI", "API", "GB", "MB", "KB", "tok", "py", "js", "json", "csv",
+                    "md", "txt", "url", "http", "https", "true", "false", "none", "null",
+                    "user", "assistant", "system", "default", "test", "tmp", "ok", "id"}
