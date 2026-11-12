@@ -1,5 +1,14 @@
 # SuperMem 超级记忆系统
 
+![stars](https://img.shields.io/github/stars/wdhoop/SuperMem?style=flat-square)
+![license](https://img.shields.io/github/license/wdhoop/SuperMem?style=flat-square)
+![python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
+![last commit](https://img.shields.io/github/last-commit/wdhoop/SuperMem?style=flat-square)
+
+> **给 AI 智能体的一等公民记忆**：写入时自动抽实体 / 事件 / 规则并建因果 + 语义边；检索融合 **图 + 向量 + 原文**三层；会按遗忘曲线衰减、会做状态流转、会判断"这条经验够不够格当结论"。
+>
+> **实测**（134 题自召回，生产库真实记忆）：@1 **74.6%** / @5 94.0% / @10 99.3%，MRR **0.846**（修复前 @1 25.6%、MRR 0.478）；库外问题拒答 **12/12**；LoCoMo 1986 题全量评测脚本与结果全部公开可复现。
+
 SuperMem — a **local-first long-term memory system for AI agents**: knowledge graph + vector search + verbatim layer, with episodic aggregation, forgetting curve, causal edges, MCP / REST interfaces. 中文定位：**本地优先、图结构 + 向量 + 原文三层的长期记忆系统**，为 AI 智能体（LLM / 数字人 / 桌面宠物）提供可检索、可演化的持久记忆底座。
 
 > **v1.2.5（2026-11-13）**：**episode 聚合加单块节点上限**——原来只有"间隔超 4 小时"一个切窗条件、没有数量上限，批量导入的同时间戳簇会被整段塞成一块（生产曾出现 361 节点巨块）。现按 `EPISODE_MAX_NODES = 40` 切分，并保证段起始时间唯一（同时间戳簇内顺延 1 秒）。生产库重算 177 → **115 块**、max **361 → 40**、幂等复跑 `created=0`。同版本清理了生产库混入的 2024 年评测语料 299 节点（同批次的 924 条真实记忆全部保留，删前导出的回滚 JSON 已留档）。详见 [CHANGELOG](CHANGELOG.md)。
