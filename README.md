@@ -200,12 +200,12 @@ SuperMem/
 ├── interrupt_budget.py / hot_cache.py / metrics.py
 ├── scheduler.py / mcp_server.py / analyze_patterns.py
 ├── bridge/smem.py              # CLI 桥接
-├── scripts/                    # selfcheck / rebuild_vector_index / watchdog / verify_assoc_backport / smoke_anchors
+├── scripts/                    # selfcheck / rebuild_vector_index / watchdog / verify_assoc_backport / smoke_anchors / migrate_fix_20261113（v1.2.4 升级迁移）
 ├── web/                        # 简版可视化面板（搜索 + 图谱）
 ├── benchmark/                  # LoCoMo 评测 + LoCoMo-Plus 评测（脚本 + 结果 + README）
 │   ├── scripts/locomo_plus/    #   LoCoMo-Plus：ingest → 联想生成 → 评测 → judge
 │   └── results/locomo_plus/    #   LoCoMo-Plus：联想句 / 评测结果 / judge 结果（JSONL）
-└── docs/                       # 架构说明 + LoCoMo 评测报告 + LoCoMo-Plus 评测报告
+└── docs/                       # 架构说明 + LoCoMo 评测报告 + LoCoMo-Plus 评测报告 + 大修修复清单 / 大修后重测报告
 ```
 
 ---
