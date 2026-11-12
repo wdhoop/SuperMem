@@ -22,7 +22,7 @@ SuperMem 把"记忆"当作一等公民：写入时自动提取实体/事件/规�
   - **原文层（verbatim）**：写入内容逐字落库，带独立向量索引，供"强召回下探"——当图检索置信不足时自动下探原文，实测对 LoCoMo 难题组带来稳定 +25~28% 增益。
 - **融合检索 `search_strong`**：图检索 + 向量检索 + 原文下探 + 时间窗过滤 + 因果链扩展，一次调用返回结构化上下文。
 - **经验转正与检索拒答（v1.1.4）**：节点级 `grade` 只分 `experience`（可当结论用）/ `hint`（只能是线索），靠类型、置信度、被命中次数、时效四道条件转正；检索结论再分四档 `answer` / `record`（一手记录，作答时标明"这是记录不是结论"）/ `hint` / `no_match`，并附原因码（`margin_flat` / `top1_not_evidence` / `no_lexical_or_anchor_support` 等）。解决"该答的说没有、不该答的硬答"。
-- **实体锚定检索（v1.1.4，新增模块 `anchors.py`）**：写入时把实体词抽进锚点表（私有词 / 高 df 泛词 / 口语虚词三道闸门），检索时先查表、命中并入融合分（RRF 权重 0.55 + 绑定强度加成 0.03），补"字面不通、语义也漂"的那一路召回；命中回写 `hits`、四级排序淘汰、表满一次删到 95% 留缓冲。
+- **实体锚定检索（v1.1.4，新增模块 `anchors.py`）**：写入时把实体词抽进锚点表（私有词 / 高 df 泛词 / 口语虚词三道闸门；中文词只从 `tags`、书名引号、实体节点内容取，正文只抽拉丁型号 token），检索时先查表、命中并入融合分（RRF 权重 0.55 + 绑定强度加成 0.03），补"字面不通、语义也漂"的那一路召回；命中回写 `hits`、四级排序淘汰、表满一次删到 95% 留缓冲。
 - **关键词路 SQL 化（v1.1.4）**：`_fts_recall` 从"Python 全表遍历逐条比对"改为 SQL 层 `instr` 先筛命中行、只对命中集算分，结果逐项一致，生产库 4.6× / 万节点库 4.7×。
 - **语义关联建边修复（v1.1.2）**：修复 related 边"漏建 + 不召回"双缺陷——写入时双向建边（新→老同时补老→新）+ k 2→8 阈值分层（强关联全建、弱关联限量）+ 检索沿 related 边扩散一跳（top 20 截断并入 RRF）+ 历史漏边一次性 backfill 脚本（幂等、可 `--dry-run` 预演）。
 - **注意力倾斜（v1.1.1，默认开启）**：检索全量召回后按当前状态向量重排——活跃目标自动感知（active goal 沿边扩散加权）+ importance 倾斜（goal_related ×1.15 / reference ×0.9）；**只改排序不删内容**，无活跃 goal 时零影响，一键 `TILT_ENABLED=False` 对照旧基线。
@@ -182,7 +182,7 @@ SuperMem/
 ├── interrupt_budget.py / hot_cache.py / metrics.py
 ├── scheduler.py / mcp_server.py / analyze_patterns.py
 ├── bridge/smem.py              # CLI 桥接
-├── scripts/                    # selfcheck / rebuild_vector_index / watchdog / verify_assoc_backport
+├── scripts/                    # selfcheck / rebuild_vector_index / watchdog / verify_assoc_backport / smoke_anchors
 ├── web/                        # 简版可视化面板（搜索 + 图谱）
 ├── benchmark/                  # LoCoMo 评测 + LoCoMo-Plus 评测（脚本 + 结果 + README）
 │   ├── scripts/locomo_plus/    #   LoCoMo-Plus：ingest → 联想生成 → 评测 → judge
