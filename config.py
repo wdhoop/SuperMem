@@ -319,6 +319,8 @@ VERDICT_MARGIN_MIN = 1.10             # top1 / top2 分比低于此 → 结果�
                                       # 3 条无关 query 判定一条未变
 VERDICT_EVIDENCE_REQUIRED = True
 VERDICT_LEXICAL_MIN = 0.6             # 字面命中强度达到这个值才算"有支撑"（整串1.0 / 多token命中0.6+）      # answer 级结论必须至少有一条 evidence 级节点
+VERDICT_ANCHOR_MIN = 2                 # [FIX 2026-11-13 P0-5] top1 自证所需锚点词命中数
+VERDICT_SELF_SCORE_MIN = 0.025         # [FIX 2026-11-13 P0-5] top1 融合分自证门槛（地板 1.25 倍）
 
 # ---- ③ 实体钩子层（anchor hook）：写入时建表，检索时查表 ----
 ANCHOR_ENABLED = True

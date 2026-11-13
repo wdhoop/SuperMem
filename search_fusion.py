@@ -672,9 +672,22 @@ def judge_verdict(results):
     conf = round(min(1.0, top1 / (config.VERDICT_ABS_FLOOR * 5.0)), 4)
     # [UPD 2026-11-12] 纯向量猜测不算"库里有"：top5 里既无实体钩子命中、也无整串字面命中，
     # 说明只是语义空间里"看着近"，库里其实没有这条内容 → 直接拒答，不给线索级答案。
-    support = any((r.get("anchor_hits") or 0) > 0 or r.get("lexical_hit") for r in results[:5])
-    if not support:
-        return "no_match", conf, "no_lexical_or_anchor_support"
+    # [FIX 2026-11-13 P0-5] 支撑必须由 top1 自己给出，不能让队列里别的条目背书。
+    #   原写法 any(... for r in results[:5])：top5 里任意一条有字面/锚点就算"库里有"，
+    #   纯向量猜出的 top1 被别人的命中兜住也能判 answer。实测"火星殖民计划第三阶段预算"
+    #   （库内为零）→ answer/ok，top1 lexical=False、fts=0.0、anchor=1、score=0.0226。
+    #   v1（只认字面/锚点）会误杀"记忆系统为什么用三层架构"（score=0.0290 但用词不重合）；
+    #   故改为三条件任一，兼顾"字面不重合但确实命中"：
+    #     a) 字面命中 ≥ VERDICT_LEXICAL_MIN
+    #     b) 锚点词命中 ≥ VERDICT_ANCHOR_MIN 个
+    #     c) 融合分 ≥ VERDICT_SELF_SCORE_MIN（0.025 = 地板的 1.25 倍）
+    #   回放：库内 40 条真实节点 query 零误杀；库外 10 条中仅"火星殖民"一条被修正为 no_match。
+    top1 = results[0]
+    top1_self = (float(top1.get("fts_sim", 0) or 0) >= config.VERDICT_LEXICAL_MIN
+                 or int(top1.get("anchor_hits", 0) or 0) >= getattr(config, "VERDICT_ANCHOR_MIN", 2)
+                 or float(top1.get("score", 0) or 0) >= getattr(config, "VERDICT_SELF_SCORE_MIN", 0.025))
+    if not top1_self:
+        return "no_match", conf, "top1_no_self_support"
     if config.VERDICT_EVIDENCE_REQUIRED and top1_kind != "experience":
         # 记录档：top1 是一手记录，且排序明确 → 可以答，但标记为记录
         if top1_kind == "record" and margin >= config.VERDICT_MARGIN_MIN:
