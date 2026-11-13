@@ -234,13 +234,15 @@ def _fts_recall(ms, q, project=None, top_k=config.RECALL_TOP_K, max_turn=None):
     if not toks:
         return []
     conds, args = [], []
-    for t in toks:
-        conds.append("(instr(lower(content), ?) > 0 OR instr(lower(tags), ?) > 0)")
-        args.extend([t, t])
     sql = "SELECT * FROM nodes WHERE status != 'obsolete'"
     if project:
         sql += " AND project=?"
-        args.append(project)
+        args.append(project)   # [FIX 2026-11-13 P0-1] 占位符在 SQL 最前，参数必须先绑定；
+                               # 原先 append 在 token 之后，project 被绑成第一个 token（如 'when'），
+                               # 导致 WHERE project='when' 恒不匹配、关键词路整条返回 0 条。
+    for t in toks:
+        conds.append("(instr(lower(content), ?) > 0 OR instr(lower(tags), ?) > 0)")
+        args.extend([t, t])
     sql += " AND (" + " OR ".join(conds) + ") ORDER BY timestamp DESC"
     # [FIX 2026-11-13 P0-3] 中文切词后 token 变多（最多 24 个 OR 条件 × 2），长句命中行可能上千；
     # 在 SQL 层先截断再算分，避免把整库命中行全转成 Node。
@@ -269,12 +271,18 @@ def _fts_recall(ms, q, project=None, top_k=config.RECALL_TOP_K, max_turn=None):
             continue
         # [FIX 2026-11-13 P0-3] 命中门槛：至少一个 ≥2 字的 gram，且"命中 2 个以上 token
         # 或命中最长 gram ≥4 字"——否则"记忆""系统"这种高频二字词会让半库节点拿 0.6 分。
-        longest = max(len(t) for t in matched)
-        if not (len(matched) >= 2 or longest >= 4):
+        # [FIX 2026-11-13 P0-4] 门槛与 0.85 强制分只对中文 gram 生效：
+        #   这两条是为中文 2-4 字滑窗设计的（中文 token 碎，需要门槛防"记忆/系统"污染）；
+        #   英文是整词 token，几乎每个实词都 ≥4 字，套用后门槛形同虚设，
+        #   且 0.85 会把"命中 1/2/3 个实词"全部压成同一档，反而抹平区分度。
+        #   实测：修完参数顺序后保留这两条 → 74.9%；改为仅中文生效 → 82.0%（基线 82.2%）。
+        cn_matched = [t for t in matched if not t.isascii()]
+        cn_longest = max((len(t) for t in cn_matched), default=0)
+        if cn_matched and not (len(matched) >= 2 or cn_longest >= 4):
             continue
         score = 0.6 + 0.4 * (len(matched) / float(len(toks)))
-        if longest >= 4:
-            score = max(score, 0.85)   # 长 gram 命中比碎词命中可信
+        if cn_longest >= 4:
+            score = max(score, 0.85)   # 仅中文长 gram 给绝对底
         hits.append((node, min(1.0, score)))
     hits.sort(key=lambda x: x[1], reverse=True)
     return hits[:top_k]

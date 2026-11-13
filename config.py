@@ -23,7 +23,10 @@ SELFCHECK_LOG_DIR = os.path.join(STORAGE_DIR, "selfcheck_logs")
 
 # ---- 服务（[FIX] 默认只绑定本机 + Token 认证）----
 HOST = "127.0.0.1"
-PORT = 18766  # 原架构 8765 被本机百度输入法占用；18765 被 pythonw 占用，均避开
+# 原架构 8765 被本机百度输入法占用；18765 被 pythonw 占用，均避开。
+# [FIX 2026-11-13] 端口改为环境变量可覆盖：隔离副本用 SUPERMEM_PORT=18799 启动，
+#   这样同步 config.py 时不会再被生产的 18766 覆盖掉副本端口（已踩过两次）。
+PORT = int(os.environ.get("SUPERMEM_PORT", "18766"))
 API_TOKEN = os.environ.get("SUPERMEM_API_TOKEN", "supermem-local-2026")
 
 # ---- 向量索引 ----
